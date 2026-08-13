@@ -46,14 +46,6 @@ function parseImage(value: unknown): ImageConfig | null {
 	return img;
 }
 
-/** Legacy area ids: old layouts stored the page backdrop under "center"
- * (the old whole-page layer). Both map onto the conversation surface —
- * the closest surviving area (the page backdrop itself was removed). */
-const LEGACY_AREA_MAP: Record<string, AreaId | undefined> = {
-	center: "conversation",
-	sidebar: "sidebar"
-};
-
 /** Read the persisted state; unknown or unreadable values fall back to defaults. */
 export function restoreState(): BackgroundState {
 	if (typeof localStorage === "undefined") return freshState();
@@ -66,8 +58,8 @@ export function restoreState(): BackgroundState {
 		if (areas === null || typeof areas !== "object") return freshState();
 		const state = freshState();
 		for (const storedKey of Object.keys(areas as Record<string, unknown>)) {
-			const area = LEGACY_AREA_MAP[storedKey] ?? (AREAS.includes(storedKey as AreaId) ? (storedKey as AreaId) : undefined);
-			if (area === undefined) continue;
+			if (!AREAS.includes(storedKey as AreaId)) continue;
+			const area = storedKey as AreaId;
 			const stored = (areas as Record<string, unknown>)[storedKey];
 			if (stored === null || typeof stored !== "object") continue;
 			const cfg: AreaConfig = state.areas[area];

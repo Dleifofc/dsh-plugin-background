@@ -118,7 +118,7 @@ export class BackgroundService {
 					let needsRepaint = false;
 					for (const area of AREAS) {
 						const host = this.areaHost(area);
-						if (host !== null && !this.layersAtEnd(host)) {
+						if (host !== null && !this.layersPlaced(area, host)) {
 							needsRepaint = true;
 							break;
 						}
@@ -127,6 +127,15 @@ export class BackgroundService {
 							if (el === null || host === null || el.parentNode !== host) {
 								needsRepaint = true;
 								break;
+							}
+							if (area === "sidebar") {
+								// Sidebar layers lead the column in fixed order
+								// (a, then b, then content) — see ensureLayer.
+								const lead = which === 0 ? null : document.getElementById(this.layerId(area, 0));
+								if (el.previousElementSibling !== (lead ?? null)) {
+									needsRepaint = true;
+									break;
+								}
 							}
 						}
 					}
@@ -445,17 +454,17 @@ export class BackgroundService {
 		return `dsh-bg-layer-${area}-${which === 0 ? "a" : "b"}`;
 	}
 
-	/** True when every non-layer child of the host precedes every layer
- * child (layers sit at the tail, never interleaved ahead of content). */
-	private layersAtEnd(host: HTMLElement): boolean {
+	/** Whether the host's children satisfy the area's placement invariant:
+ * sidebar layers lead the column; every other area's layers trail it. */
+	private layersPlaced(area: AreaId, host: HTMLElement): boolean {
 		let sawLayer = false;
+		let sawContent = false;
 		for (const child of Array.from(host.children)) {
 			const isLayer = (child as HTMLElement).id?.startsWith("dsh-bg-layer") ?? false;
-			if (isLayer) {
-				sawLayer = true;
-			} else if (sawLayer) {
-				return false;
-			}
+			if (isLayer) sawLayer = true;
+			else sawContent = true;
+			// lead: a layer after content is wrong; trail: content after a layer is wrong
+			if (isLayer ? area === "sidebar" && sawContent : area !== "sidebar" && sawLayer) return false;
 		}
 		return true;
 	}
@@ -464,19 +473,24 @@ export class BackgroundService {
 	private areaHost(area: AreaId): HTMLElement | null {
 		switch (area) {
 			case "sidebar": {
-				// Only the REAL sidebar column counts: during the boot loading
-				// screen the selector below can match loading-screen markup,
-				// and absolute-positioned layers there would flash across the
-				// whole viewport. The real column always contains the settings
-				// trigger button; the loading page never does.
-				const col = document.querySelector("#root > div > div:nth-child(1)");
-				if (!(col instanceof HTMLElement)) return null;
-				return col.querySelector('button[aria-haspopup="dialog"]') !== null ? col : null;
+				// The column is the settings trigger's ancestor whose parent
+				// holds the conversation surface. Slot outlets are wrapped in
+				// display:contents divs, so structural selectors are off by
+				// one — the climb works at any wrapper depth.
+				const trigger = document.querySelector('button[aria-haspopup="dialog"]');
+				const scroll = document.querySelector("[data-conversation-scroll]");
+				let node = trigger?.parentElement ?? null;
+				while (node instanceof HTMLElement && node !== document.body) {
+					const parent = node.parentElement;
+					if (parent instanceof HTMLElement && scroll !== null && parent.contains(scroll)) return node;
+					node = parent;
+				}
+				return null;
 			}
 			case "conversation":
-				// ConversationRoot: [data-conversation-scroll] is a direct child
-				// of the surface root; mount the layers on that root so the
-				// background stays fixed while the messages scroll.
+				// [data-conversation-scroll] is a direct child of the surface
+				// root; mount the layers on that root so the background stays
+				// fixed while the messages scroll.
 				return document.querySelector("[data-conversation-scroll]")?.parentElement ?? null;
 			case "trajectory":
 				return document.querySelector("[data-conversation-composer-overlay]");
@@ -487,11 +501,11 @@ export class BackgroundService {
 		}
 	}
 
-	/** Create (or re-anchor) one layer element for an area. Layers always sit
-	 * at the END of their host: boot can append one before the shell renders
-	 * the host's real content, and a layer ahead of the content breaks the
-	 * content-lift CSS (`> *:not(...)` keeps working either way, but DOM
-	 * order must not interleave the layers with React-owned children). */
+	/** Create (or re-anchor) one layer element for an area. Layers sit at
+	 * the END of their host; the sidebar is the exception — its layers LEAD
+	 * the column (a, then b, then content) so tree order alone (content
+	 * position:relative, z auto) keeps content above the wallpaper without
+	 * a z-index that would trap the settings dialog inside the wrapper. */
 	private ensureLayer(area: AreaId, which: LayerIndex): HTMLElement {
 		const id = this.layerId(area, which);
 		const host = this.areaHost(area);
@@ -502,8 +516,21 @@ export class BackgroundService {
 			el.setAttribute("aria-hidden", "true");
 		}
 		if (host !== null) {
-			if (el.parentNode !== host) host.appendChild(el);
-			else if (host.lastElementChild !== el) host.appendChild(el);
+			if (area === "sidebar") {
+				const lead = which === 0 ? null : document.getElementById(this.layerId(area, 0));
+				if (el.parentNode !== host || el.previousElementSibling !== (lead ?? null)) {
+					const oldParent = el.parentNode;
+					if (oldParent instanceof HTMLElement && oldParent !== host) oldParent.removeAttribute("data-dshbg-sidebar-host");
+					host.insertBefore(el, lead !== null ? lead.nextSibling : host.firstChild);
+				}
+				// CSS matches the host via this marker (structural selectors are
+				// off by one behind the shell's slot wrappers).
+				host.setAttribute("data-dshbg-sidebar-host", "");
+			} else if (el.parentNode !== host) {
+				host.appendChild(el);
+			} else if (host.lastElementChild !== el) {
+				host.appendChild(el);
+			}
 		}
 		return el;
 	}
@@ -516,6 +543,9 @@ export class BackgroundService {
 		const root = document.documentElement;
 		for (const area of AREAS) {
 			root.removeAttribute(`data-dsh-bg-${area}`);
+		}
+		for (const host of Array.from(document.querySelectorAll("[data-dshbg-sidebar-host]"))) {
+			host.removeAttribute("data-dshbg-sidebar-host");
 		}
 	}
 

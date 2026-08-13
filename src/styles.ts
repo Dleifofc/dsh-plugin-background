@@ -12,35 +12,30 @@
 
 /** Layer + section styles, injected once at bundle load. */
 export const CSS = [
-	/* ---- per-area layer pairs (a = active candidate, b = alternate) ----
-	 * Layers default to opacity 0: the service drives opacity inline, and a
-	 * freshly (re-)created layer must never sit at the CSS default opacity 1
-	 * covering its painted sibling with the fallback background-color (this
-	 * happened after session/view switches re-created the layer pair). */
-	/* sidebar: absolute layer pairs inside the sidebar column */
-	"#dsh-bg-layer-sidebar-a,#dsh-bg-layer-sidebar-b{position:absolute;inset:0;z-index:0;pointer-events:none;background-color:#0b1026;opacity:0;transition:opacity .45s ease,filter .3s ease}",
+		/* ---- per-area layer pairs (a = active candidate, b = alternate) ----
+	 * Layers default to opacity 0 (the service drives opacity inline) and
+	 * carry NO background: transparent media pixels fall through to the
+	 * shell's own theme surface, so light/dark themes need no special case. */
+	"#dsh-bg-layer-sidebar-a,#dsh-bg-layer-sidebar-b{position:absolute;inset:0;z-index:0;pointer-events:none;opacity:0;transition:opacity .45s ease,filter .3s ease}",
 	/* conversation: absolute layer pairs inside the conversation surface root
 	 * (the scroll container stays transparent so the layer shows through) */
-	"#dsh-bg-layer-conversation-a,#dsh-bg-layer-conversation-b{position:absolute;inset:0;z-index:0;pointer-events:none;background-color:#0b1026;opacity:0;transition:opacity .45s ease,filter .3s ease}",
+	"#dsh-bg-layer-conversation-a,#dsh-bg-layer-conversation-b{position:absolute;inset:0;z-index:0;pointer-events:none;opacity:0;transition:opacity .45s ease,filter .3s ease}",
 	/* trajectory: absolute layer pairs inside the trajectory view root */
-	"#dsh-bg-layer-trajectory-a,#dsh-bg-layer-trajectory-b{position:absolute;inset:0;z-index:0;pointer-events:none;background-color:#0b1026;opacity:0;transition:opacity .45s ease,filter .3s ease}",
+	"#dsh-bg-layer-trajectory-a,#dsh-bg-layer-trajectory-b{position:absolute;inset:0;z-index:0;pointer-events:none;opacity:0;transition:opacity .45s ease,filter .3s ease}",
 	/* settings: absolute layer pairs inside the settings dialog panel */
-	"#dsh-bg-layer-settings-a,#dsh-bg-layer-settings-b{position:absolute;inset:0;z-index:0;pointer-events:none;background-color:#0b1026;opacity:0;transition:opacity .45s ease,filter .3s ease}",
+	"#dsh-bg-layer-settings-a,#dsh-bg-layer-settings-b{position:absolute;inset:0;z-index:0;pointer-events:none;opacity:0;transition:opacity .45s ease,filter .3s ease}",
 	/* media child: fills the layer; images paint via background-image, videos
 	 * via object-fit (both sized/positioned inline by the service) */
 	".dshbg-media{position:absolute;inset:0;width:100%;height:100%;background-repeat:no-repeat}",
 	"video.dshbg-media{object-fit:cover;object-position:center}",
 	/* ---- transparency + content lift per area ---- */
-	/* sidebar: column goes transparent; every NON-LAYER child rises above the
-	 * layers (never :first-child — boot can insert a layer before the shell
-	 * renders the column, and that rule would lift the layer itself). The
-	 * z-index is 2, above the other surfaces' z-1 lifts: the settings dialog
-	 * is a fixed DESCENDANT of this column and must stay above the
-	 * conversation/trajectory surfaces when several areas are on. The column
-	 * root itself paints `--dsw-specific-sidebar-fill` — it goes transparent
-	 * too, or it would cover the layers entirely. */
-	"html[data-dsh-bg-sidebar=on] #root > div > div:nth-child(1){background:transparent!important;position:relative}",
-	"html[data-dsh-bg-sidebar=on] #root > div > div:nth-child(1) > *:not([id^=\"dsh-bg-layer\"]){position:relative;z-index:2;background:transparent!important}",
+		/* sidebar: the service marks the column with data-dshbg-sidebar-host
+	 * (slot wrappers make structural selectors off by one). Content gets
+	 * position:relative ONLY — a z-index here would trap the settings dialog
+	 * (fixed overlay inside the wrapper) under the center column. The layers
+	 * lead the column, so tree order keeps content above the wallpaper. */
+	"html[data-dsh-bg-sidebar=on] [data-dshbg-sidebar-host]{background:transparent!important;position:relative}",
+	"html[data-dsh-bg-sidebar=on] [data-dshbg-sidebar-host] > *:not([id^=\"dsh-bg-layer\"]){position:relative;background:transparent!important}",
 	/* conversation: the surface root (parent of [data-conversation-scroll])
 	 * goes transparent and its children rise above the layers */
 	"html[data-dsh-bg-conversation=on] div:has(> [data-conversation-scroll]){background:transparent!important;position:relative}",

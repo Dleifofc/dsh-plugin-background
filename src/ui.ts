@@ -233,9 +233,11 @@ function EditorPanel(props: {
 				children: [
 					jsx(DetailField, { t, labelKey: "detail.posX", value: img.posX, onCommit: (v: string) => onUpdate(index, { posX: v }) }),
 					jsx(DetailField, { t, labelKey: "detail.posY", value: img.posY, onCommit: (v: string) => onUpdate(index, { posY: v }) }),
-					jsx(NumberField, { t, labelKey: "detail.scale", value: img.scale, min: 10, max: 500, onCommit: (v: number) => onUpdate(index, { scale: v }) }),
-					jsx(DetailField, { t, labelKey: "detail.width", value: img.width, placeholder: "auto / 800px / 120%", onCommit: (v: string) => onUpdate(index, { width: v }) }),
-					jsx(DetailField, { t, labelKey: "detail.height", value: img.height, placeholder: "auto / 600px / 100%", onCommit: (v: string) => onUpdate(index, { height: v }) }),
+					// Videos size through object-fit (cover/contain/fill) — the
+					// image-only scale/width/height fields would silently no-op.
+					!isVideo ? jsx(NumberField, { t, labelKey: "detail.scale", value: img.scale, min: 10, max: 500, onCommit: (v: number) => onUpdate(index, { scale: v }) }) : null,
+					!isVideo ? jsx(DetailField, { t, labelKey: "detail.width", value: img.width, placeholder: "auto / 800px / 120%", onCommit: (v: string) => onUpdate(index, { width: v }) }) : null,
+					!isVideo ? jsx(DetailField, { t, labelKey: "detail.height", value: img.height, placeholder: "auto / 600px / 100%", onCommit: (v: string) => onUpdate(index, { height: v }) }) : null,
 					!isVideo ? jsxs("label", {
 						className: "dshbg-detailField",
 						children: [

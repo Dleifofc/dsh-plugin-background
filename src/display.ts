@@ -27,7 +27,12 @@ export function resolveDisplay(img: ImageConfig): DisplayValues {
 	} else if (img.mode === "custom") {
 		size = img.width !== "" || img.height !== ""
 			? `${img.width !== "" ? img.width : "auto"} ${img.height !== "" ? img.height : "auto"}`
-			: (img.scale !== 100 ? `${img.scale}% ${img.scale}%` : "auto");
+			// Single-value percentage: width = scale% of the area, height auto —
+			// a UNIFORM zoom. The old `${scale}% ${scale}%` resolved each axis
+			// against the area independently and distorted the image wherever
+			// the area's aspect differed from the media's (worst in the tall,
+			// narrow sidebar column).
+			: (img.scale !== 100 ? `${img.scale}%` : "auto");
 		position = `${img.posX} ${img.posY}`;
 		repeat = img.repeat;
 	}
