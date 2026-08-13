@@ -1,0 +1,36 @@
+# ── 依赖 ──────────────────────────────────────────────
+node_modules/
+
+# ── 构建产物（lib/client.js 由 esbuild 生成，用 npm run build 重建）──
+lib/client.js
+
+# ── 本地环境 / 敏感信息 ───────────────────────────────
+# 环境变量与凭据（绝不提交真实值；需要样例时用 .env.example）
+.env
+.env.*
+!.env.example
+*.local
+credentials*
+*.key
+*.pem
+*.p12
+*.pfx
+
+# ── 本机开发环境痕迹 ──────────────────────────────────
+# 编辑器 / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# 操作系统
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── 日志与临时文件 ────────────────────────────────────
+*.log
+npm-debug.log*
+tmp/
+temp/
