@@ -2,14 +2,34 @@
  * src/types.ts — shared domain types for the background plugin.
  */
 
-/**
- * Shell areas, each with an independent image group:
- * - conversation: the conversation surface (message list + composer)
- * - trajectory: the trajectory view surface (conversation view tab)
- * - sidebar: the left sidebar column
- * - settings: the settings dialog panel
- */
+/** Built-in shell surfaces, each with an independent media group. */
 export type AreaId = "conversation" | "trajectory" | "sidebar" | "settings";
+
+/**
+ * A backgroundable surface:
+ * - the four built-in area ids above;
+ * - `panel-right:<tabTitle>` / `panel-bottom:<tabTitle>` for individual
+ *   dsh-better-sidebar tabs (discovered from the DOM at runtime; persisted
+ *   per title so a tab's background survives close/reopen).
+ */
+export type SurfaceId = string;
+
+/** Which panel a tab surface belongs to. */
+export type SurfaceGroup = "builtin" | "panel-right" | "panel-bottom" | "group";
+
+/** Display metadata for one surface (for the settings list). */
+export interface SurfaceMeta {
+	/** Builtin: the area id; tab: the tab bar title; group: the group name. */
+	label: string;
+	group: SurfaceGroup;
+	/** Whether the surface exists in the DOM right now. */
+	available: boolean;
+	/** Group surfaces: the merged member surface ids (display order). */
+	members?: SurfaceId[];
+	/** Non-group surfaces: the merged group they belong to (undefined when
+	 * standalone). */
+	memberOf?: SurfaceId;
+}
 
 /** Quick display modes for an image. */
 export type DisplayMode = "cover" | "contain" | "fill" | "repeat" | "center" | "custom";
@@ -60,7 +80,7 @@ export interface ImageConfig {
 	blur: number;
 }
 
-/** Per-area configuration. */
+/** Per-surface configuration. */
 export interface AreaConfig {
 	enabled: boolean;
 	images: ImageConfig[];
@@ -70,15 +90,26 @@ export interface AreaConfig {
 	random: boolean;
 }
 
+/** One merged group: several surfaces painted as ONE continuous canvas. */
+export interface GroupDef {
+	/** Stable id, `group:<n>`. */
+	id: SurfaceId;
+	/** Member surface ids (non-group surfaces only). */
+	members: SurfaceId[];
+}
+
 /** Persisted state (localStorage), plus runtime playback position. */
 export interface BackgroundState {
-	areas: Record<AreaId, AreaConfig>;
+	areas: Record<SurfaceId, AreaConfig>;
+	groups: GroupDef[];
 }
 
 /** Immutable snapshot handed to the settings store / UI. */
 export interface BackgroundSnapshot extends BackgroundState {
-	/** Current playback index per area (runtime, not persisted). */
-	index: Record<AreaId, number>;
+	/** Current playback index per surface (runtime, not persisted). */
+	index: Record<SurfaceId, number>;
+	/** Display metadata per surface (labels, groups, availability). */
+	meta: Record<SurfaceId, SurfaceMeta>;
 	/** Last persistence error key ("quota" etc.), null when fine. */
 	lastError: string | null;
 	revision: number;

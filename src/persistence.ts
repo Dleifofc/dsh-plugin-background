@@ -6,13 +6,22 @@ import {
 	AREAS, DEFAULT_AREA, DEFAULT_IMAGE, IDB_NAME, IDB_STORE, MODES, REPEATS, STORAGE_KEY, clamp,
 	defaultState, mediaOfName
 } from "./constants";
-import type { AreaConfig, AreaId, BackgroundState, ImageConfig } from "./types";
+import type { AreaConfig, BackgroundState, GroupDef, ImageConfig, SurfaceId } from "./types";
 
 //#region config persistence (localStorage)
 
-/** Build a fresh (default) state object. Each area owns its media array. */
+/** Build a fresh (default) state object. Each surface owns its media array. */
 export function freshState(): BackgroundState {
 	return defaultState();
+}
+
+/** True when a stored surface key is recognized: one of the built-in areas,
+ * or a dsh-better-sidebar tab surface (panel-right:/panel-bottom: + title). */
+function validSurfaceKey(key: string): boolean {
+	if ((AREAS as readonly string[]).includes(key)) return true;
+	if (key.startsWith("panel-right:") || key.startsWith("panel-bottom:")) return true;
+	// Merged-group surfaces persist their media like any other surface.
+	return key.startsWith("group:");
 }
 
 /** Narrow an unknown parsed value to an ImageConfig, or null. */
@@ -57,12 +66,22 @@ export function restoreState(): BackgroundState {
 		const areas = (parsed as Record<string, unknown>).areas;
 		if (areas === null || typeof areas !== "object") return freshState();
 		const state = freshState();
+		const groupsRaw = (parsed as Record<string, unknown>).groups;
+		if (Array.isArray(groupsRaw)) {
+			for (const rawGroup of groupsRaw) {
+				if (rawGroup === null || typeof rawGroup !== "object") continue;
+				const rec = rawGroup as Record<string, unknown>;
+				if (typeof rec.id !== "string" || !rec.id.startsWith("group:") || !Array.isArray(rec.members)) continue;
+				const members = rec.members.filter((m): m is string => typeof m === "string" && validSurfaceKey(m));
+				if (members.length > 0) state.groups.push({ id: rec.id, members });
+			}
+		}
 		for (const storedKey of Object.keys(areas as Record<string, unknown>)) {
-			if (!AREAS.includes(storedKey as AreaId)) continue;
-			const area = storedKey as AreaId;
+			if (!validSurfaceKey(storedKey)) continue;
 			const stored = (areas as Record<string, unknown>)[storedKey];
 			if (stored === null || typeof stored !== "object") continue;
-			const cfg: AreaConfig = state.areas[area];
+			const cfg: AreaConfig = state.areas[storedKey] ?? { ...DEFAULT_AREA, images: [] };
+			state.areas[storedKey] = cfg;
 			const rec = stored as Record<string, unknown>;
 			if (typeof rec.enabled === "boolean") cfg.enabled = rec.enabled;
 			if (Array.isArray(rec.images)) {

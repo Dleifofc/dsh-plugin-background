@@ -16,6 +16,11 @@ export const CSS = [
 	 * Layers default to opacity 0 (the service drives opacity inline) and
 	 * carry NO background: transparent media pixels fall through to the
 	 * shell's own theme surface, so light/dark themes need no special case. */
+	/* generic fallback: EVERY layer element shares the same chrome. The
+	 * specific rules below stay for readability; merged-group layers
+	 * (dsh-bg-layer-group:<n>-<member>-<a|b>) rely on THIS rule — without
+	 * it they are static block divs and the group background never shows. */
+	"div[id^=\"dsh-bg-layer-\"]{position:absolute;inset:0;z-index:0;pointer-events:none;opacity:0;transition:opacity .45s ease,filter .3s ease}",
 	"#dsh-bg-layer-sidebar-a,#dsh-bg-layer-sidebar-b{position:absolute;inset:0;z-index:0;pointer-events:none;opacity:0;transition:opacity .45s ease,filter .3s ease}",
 	/* conversation: absolute layer pairs inside the conversation surface root
 	 * (the scroll container stays transparent so the layer shows through) */
@@ -24,9 +29,18 @@ export const CSS = [
 	"#dsh-bg-layer-trajectory-a,#dsh-bg-layer-trajectory-b{position:absolute;inset:0;z-index:0;pointer-events:none;opacity:0;transition:opacity .45s ease,filter .3s ease}",
 	/* settings: absolute layer pairs inside the settings dialog panel */
 	"#dsh-bg-layer-settings-a,#dsh-bg-layer-settings-b{position:absolute;inset:0;z-index:0;pointer-events:none;opacity:0;transition:opacity .45s ease,filter .3s ease}",
+	/* better-sidebar tab surfaces: one layer pair per tab, absolutely
+	 * positioned inside the tagged paneTab content div */
+	"div[id^=\"dsh-bg-layer-tab-\"]{position:absolute;inset:0;z-index:0;pointer-events:none;opacity:0;transition:opacity .45s ease,filter .3s ease}",
+	/* paneTab is NOT positioned by better-sidebar — anchor our tab/group
+	 * layers to the tab div itself (otherwise they stretch across the whole
+	 * pane and slices misalign) */
+	"[data-dshbg-tab-surface]{position:relative!important}",
 	/* media child: fills the layer; images paint via background-image, videos
 	 * via object-fit (both sized/positioned inline by the service) */
 	".dshbg-media{position:absolute;inset:0;width:100%;height:100%;background-repeat:no-repeat}",
+	/* merged-group slices clip to their member (the canvas may overflow) */
+	".dshbg-slice{overflow:hidden}",
 	"video.dshbg-media{object-fit:cover;object-position:center}",
 	/* ---- transparency + content lift per area ---- */
 		/* sidebar: the service marks the column with data-dshbg-sidebar-host
@@ -51,9 +65,15 @@ export const CSS = [
 	"html[data-dsh-bg-trajectory=on] [data-conversation-composer-overlay] *:not([id^=\"dsh-bg-layer\"]){background-color:transparent!important}",
 	/* settings: the dialog panel (already positioned) goes transparent, its
 	 * nav/content surfaces follow, and its children rise above the layers */
-	"html[data-dsh-bg-settings=on] [role=\"dialog\"][aria-modal=\"true\"]{background:transparent!important}",
-	"html[data-dsh-bg-settings=on] [role=\"dialog\"][aria-modal=\"true\"] > *:not([id^=\"dsh-bg-layer\"]){position:relative;z-index:1}",
-	"html[data-dsh-bg-settings=on] [role=\"dialog\"][aria-modal=\"true\"] *:not([id^=\"dsh-bg-layer\"]){background-color:transparent!important}",
+	"html[data-dsh-bg-settings=on] [role=\"dialog\"][aria-modal=\"true\"][aria-labelledby]{background:transparent!important}",
+	"html[data-dsh-bg-settings=on] [role=\"dialog\"][aria-modal=\"true\"][aria-labelledby] > *:not([id^=\"dsh-bg-layer\"]){position:relative;z-index:1}",
+	"html[data-dsh-bg-settings=on] [role=\"dialog\"][aria-modal=\"true\"][aria-labelledby] *:not([id^=\"dsh-bg-layer\"]){background-color:transparent!important}",
+	/* better-sidebar tab surfaces: the tagged paneTab content div (marked by
+	 * the service with data-dshbg-tab-surface; data-dshbg-tab-on marks the
+	 * enabled ones) goes transparent and its content rises above the layers */
+	"[data-dshbg-tab-surface][data-dshbg-tab-on]{background:transparent!important}",
+	"[data-dshbg-tab-surface][data-dshbg-tab-on] > *:not([id^=\"dsh-bg-layer\"]){position:relative;z-index:1}",
+	"[data-dshbg-tab-surface][data-dshbg-tab-on] *:not([id^=\"dsh-bg-layer\"]){background-color:transparent!important}",
 	/* ---- settings UI ---- */
 	".dshbg-root{flex-direction:column;gap:18px;display:flex}",
 	".dshbg-head{flex-direction:column;gap:4px;display:flex}",
@@ -73,6 +93,32 @@ export const CSS = [
 	".dshbg-cardBody{border-top:1px solid var(--dsw-alias-border-l2);flex-direction:column;margin:0 16px;padding:12px 0 8px;display:flex}",
 	/* area segmented control */
 	".dshbg-seg{box-sizing:border-box;border:1px solid var(--dsw-alias-border-l2);flex:none;gap:2px;width:max-content;max-width:100%;padding:3px;background:var(--dsw-alias-bg-module-platform);border-radius:12px;display:flex;flex-wrap:wrap}",
+	/* surface list (unified selection model) */
+	".dshbg-surfaces{border:1px solid var(--dsw-alias-border-l2);flex-direction:column;border-radius:12px;background:var(--dsw-alias-bg-module-platform);overflow:hidden}",
+	".dshbg-surfaceGroup{color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-bg-layer-2);padding:6px 12px;font-size:11px;font-weight:600;line-height:16px}",
+	".dshbg-surfaceRow{width:100%;border:0;background:0 0;color:inherit;text-align:left;align-items:center;gap:10px;padding:8px 12px;font:inherit;display:flex;cursor:pointer}",
+	".dshbg-surfaceRow:hover{background:var(--dsw-alias-interactive-bg-hover)}",
+	".dshbg-surfaceRow.dshbg-focused{background:var(--dsw-alias-interactive-bg-hover-accent)}",
+	".dshbg-surfaceRow.dshbg-unavailable{opacity:.5}",
+	".dshbg-surfaceRow.dshbg-dropTarget{border-radius:8px;outline:2px dashed var(--dsw-static-deepseek-400);outline-offset:-2px}",
+	".dshbg-surfaceRow.dshbg-groupRow{flex-wrap:wrap;gap:6px 10px}",
+	".dshbg-surfaces.dshbg-dragOut{border-radius:12px;outline:2px dashed var(--dsw-alias-label-dimmed);outline-offset:2px}",
+	".dshbg-chips{flex:1;min-width:0;align-items:center;gap:4px;display:flex;flex-wrap:wrap}",
+	".dshbg-chipX{box-sizing:border-box;cursor:pointer;width:16px;height:16px;color:var(--dsw-alias-label-secondary);background:0 0;border:none;border-radius:8px;align-items:center;justify-content:center;padding:0;font-size:11px;line-height:11px;display:inline-flex}",
+	".dshbg-chipX:hover{color:var(--dsw-alias-state-error-primary);background:var(--dsw-alias-bg-mask-2)}",
+	".dshbg-detailHead{align-items:center;gap:10px;display:flex;flex-wrap:wrap}",
+	".dshbg-detailName{flex:1;min-width:0;color:var(--dsw-alias-label-primary);font-size:13px;font-weight:600;line-height:20px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
+	".dshbg-surfaceRow.dshbg-indent{padding-left:34px}",
+	".dshbg-surfaceCheck{flex:none;margin:0;accent-color:var(--dsw-static-deepseek-400)}",
+	".dshbg-surfaceName{flex:1;min-width:0;color:var(--dsw-alias-label-primary);font-size:13px;line-height:18px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
+	".dshbg-surfaceCount{flex:none;color:var(--dsw-alias-label-caption);font-size:11px;line-height:18px;font-variant-numeric:tabular-nums}",
+	".dshbg-surfaceDot{width:6px;height:6px;flex:none;background:var(--dsw-alias-label-tertiary);border-radius:50%}",
+	".dshbg-surfaceDot[data-active=true]{background:var(--dsw-static-deepseek-400)}",
+	".dshbg-surfaceRow.dshbg-ingroup{opacity:.65}",
+	".dshbg-surfaceBadge{flex:none;box-sizing:border-box;color:var(--dsw-alias-label-caption);border:1px solid var(--dsw-alias-border-l2);border-radius:6px;padding:0 6px;font-size:10px;line-height:16px;white-space:nowrap}",
+	".dshbg-chip{box-sizing:border-box;color:var(--dsw-alias-label-secondary);border:1px solid var(--dsw-alias-border-l2);border-radius:8px;padding:1px 8px;font-size:11px;line-height:16px;white-space:nowrap}",
+	".dshbg-surfaceHint{color:var(--dsw-alias-label-caption);font-size:11px;line-height:16px}",
+	".dshbg-surfaceActions{align-items:center;gap:8px;display:flex;flex-wrap:wrap}",
 	".dshbg-segBtn{box-sizing:border-box;cursor:pointer;height:30px;color:var(--dsw-alias-label-secondary);text-align:center;background:0 0;border:none;border-radius:9px;align-items:center;gap:6px;padding:0 14px;font:inherit;font-size:13px;line-height:18px;display:flex}",
 	".dshbg-segBtn:hover:not(.dshbg-selected){color:var(--dsw-alias-label-primary);background:var(--dsw-alias-interactive-bg-hover)}",
 	".dshbg-segBtn.dshbg-selected{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-2);box-shadow:var(--dsw-shadow-lv1)}",

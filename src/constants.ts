@@ -1,9 +1,10 @@
 /**
  * src/constants.ts — areas, modes, defaults, shared helpers.
  */
-import type { AreaConfig, AreaId, DisplayMode, ImageConfig, MediaType, RepeatMode } from "./types";
+import type { AreaConfig, AreaId, DisplayMode, GroupDef, ImageConfig, MediaType, RepeatMode, SurfaceId } from "./types";
 
-/** Background-able areas of the shell, each with an independent image group. */
+/** Built-in backgroundable surfaces. Better-sidebar tabs are dynamic surfaces
+ * (panel-right:<title> / panel-bottom:<title>) discovered at runtime. */
 export const AREAS: readonly AreaId[] = Object.freeze(["conversation", "trajectory", "sidebar", "settings"]);
 
 /** Quick display modes for an image. */
@@ -50,15 +51,23 @@ export const DEFAULT_AREA: AreaConfig = Object.freeze({
 	random: false
 });
 
-/** Build a fresh default state over every area. */
-export function defaultState(): { areas: Record<AreaId, AreaConfig> } {
-	const areas = {} as Record<AreaId, AreaConfig>;
+/** Build a fresh default state over the built-in surfaces. */
+export function defaultState(): { areas: Record<SurfaceId, AreaConfig>; groups: GroupDef[] } {
+	const areas = {} as Record<SurfaceId, AreaConfig>;
 	for (const area of AREAS) areas[area] = { ...DEFAULT_AREA, images: [] as ImageConfig[] };
-	return { areas };
+	return { areas, groups: [] };
 }
 
-/** Default state: every area off until the user configures images. */
+/** Default state: every surface off until the user configures images. */
 export const DEFAULT_STATE = Object.freeze(defaultState());
+
+/** Stable short hash of a surface id (tab titles carry arbitrary characters
+ * that cannot appear in CSS identifiers / attribute names). */
+export function surfaceHash(id: string): string {
+	let h = 5381;
+	for (let i = 0; i < id.length; i++) h = ((h * 33) ^ id.charCodeAt(i)) >>> 0;
+	return h.toString(36);
+}
 
 export function clamp(value: number, min: number, max: number): number {
 	return Math.min(max, Math.max(min, value));

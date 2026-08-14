@@ -5,11 +5,12 @@
  */
 import { BackgroundService } from "./service";
 import { createBackgroundStore } from "./store";
+import { restoreState } from "./persistence";
 import { BackgroundCard } from "./ui";
 import { zh, en } from "./locales";
 import { AREAS, DEFAULT_STATE, STORAGE_KEY } from "./constants";
 import { CSS } from "./styles";
-import type { AreaId, BackgroundSnapshot, ImageConfig } from "./types";
+import type { AreaId, BackgroundSnapshot, ImageConfig, SurfaceId } from "./types";
 
 /** Variables injected by the build banner (see build.mjs). */
 declare const module: { exports: Record<string, unknown> };
@@ -77,7 +78,12 @@ export function apply(ctx: PluginCtx): void {
 			setRandom: (area: AreaId, random: boolean) => background.setRandom(area, random),
 			next: (area: AreaId) => background.next(area),
 			showImage: (area: AreaId, index: number) => background.showImage(area, index),
-			resolvePreview: (img: ImageConfig) => background.displayUrlOf(img)
+			resolvePreview: (img: ImageConfig) => background.displayUrlOf(img),
+			mergeSurfaces: (members: SurfaceId[]) => background.mergeSurfaces(members),
+			unmerge: (groupId: SurfaceId) => background.unmerge(groupId),
+			addMemberToGroup: (groupId: SurfaceId, member: SurfaceId) => background.addMemberToGroup(groupId, member),
+			removeMemberFromGroup: (groupId: SurfaceId, member: SurfaceId) => background.removeMemberFromGroup(groupId, member),
+			clearSurface: (surface: SurfaceId) => background.clearSurface(surface)
 		};
 	};
 	ctx.slots.inject("settings.plugin.item", () => ctx.slots.register({
@@ -97,6 +103,7 @@ Object.assign(exports, {
 	SETTINGS_NS,
 	STORAGE_KEY,
 	BackgroundService,
+	restoreState,
 	apply,
 	inject,
 	name

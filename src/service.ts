@@ -1,13 +1,16 @@
 /**
- * src/service.ts — BackgroundService: owns the persisted per-area state
+ * src/service.ts — BackgroundService: owns the persisted per-surface state
  * (media groups + per-image display/rendering config + slideshow playback),
- * paints each area's layer pair, and emits `background/change` snapshots.
+ * paints each surface's layer pair, and emits `background/change` snapshots.
  *
- * Areas: conversation (message surface), trajectory (trajectory
- * view), sidebar (left column), settings (settings dialog). Each area owns TWO stacked layer elements (a/b) so media switches
- * can crossfade: the incoming layer fades in while the outgoing one fades
- * out. Every layer hosts exactly one media child — a background-image div for
- * images/GIFs or a muted looping <video> for videos.
+ * Surfaces: the four built-in areas (conversation / trajectory / sidebar /
+ * settings) plus one surface PER dsh-better-sidebar tab (`panel-right:<title>`
+ * / `panel-bottom:<title>`, discovered from the DOM and persisted per title
+ * so a tab's background survives close/reopen). Each surface owns TWO stacked
+ * layer elements (a/b) so media switches can crossfade: the incoming layer
+ * fades in while the outgoing one fades out. Every layer hosts exactly one
+ * media child — a background-image div for images/GIFs or a muted looping
+ * <video> for videos.
  *
  * Switches are preloaded and crossfaded: the next media is fetched early
  * (half an interval ahead), and the switch only lands once the media has
@@ -15,18 +18,18 @@
  * empty layer. The crossfade itself is driven by the Web Animations API
  * (`Element.animate`), not by CSS transitions, so it runs regardless of
  * shell stylesheet overrides and can be retargeted mid-fade. A switch to
- * the SAME media (single-image areas, per-image tweaks) repaints in place
- * without any fade. Each area's group holds ONE media kind — images switch
- * like a slideshow, videos play; mixed groups are not supported. Local
- * files live in IndexedDB as raw bytes and display through lazily-created
- * object URLs (cached and revoked here). Opacity and blur are per image,
- * not per area.
+ * the SAME media (single-image surfaces, per-image tweaks) repaints in place
+ * without any fade. Each surface's group holds ONE media kind — images
+ * switch like a slideshow, videos play; mixed groups are not supported.
+ * Local files live in IndexedDB as raw bytes and display through
+ * lazily-created object URLs (cached and revoked here). Opacity and blur
+ * are per image, not per surface.
  */
-import { AREAS, TICK_MS, clamp, escapeCssString } from "./constants";
+import { AREAS, DEFAULT_AREA, TICK_MS, clamp, escapeCssString, surfaceHash } from "./constants";
 import { resolveDisplay, videoFitOf } from "./display";
 import { deleteStoredFile } from "./files";
 import { idbGetFile, persistState, restoreState } from "./persistence";
-import type { AreaId, BackgroundSnapshot, BackgroundState, ImageConfig, MediaType } from "./types";
+import type { AreaConfig, BackgroundSnapshot, BackgroundState, ImageConfig, MediaType, SurfaceId, SurfaceMeta } from "./types";
 
 /** Cordis context subset the service needs. */
 export interface BackgroundCtx {
@@ -34,9 +37,9 @@ export interface BackgroundCtx {
 	emit(event: string, payload?: unknown): void;
 }
 
-/** Outcome of adding media to an area. A group holds ONE media kind — images
- * switch like a slideshow, videos play — mixed batches are filtered to the
- * group's kind and the leftovers reported here for the editor UI. */
+/** Outcome of adding media to a surface. A group holds ONE media kind —
+ * images switch like a slideshow, videos play — mixed batches are filtered
+ * to the group's kind and the leftovers reported here for the editor UI. */
 export interface AddImagesResult {
 	added: number;
 	/** Count of configs skipped because their kind differs from the group's. */
@@ -54,18 +57,29 @@ const FADE_SETTLE_MS = FADE_MS + 80;
 /** Which physical layer element is which. */
 type LayerIndex = 0 | 1;
 
-/** Build a fresh per-area record. */
-function perArea<T>(init: () => T): Record<AreaId, T> {
-	const rec = {} as Record<AreaId, T>;
-	for (const area of AREAS) rec[area] = init();
-	return rec;
+/** True when a surface id is a better-sidebar tab surface. */
+function isTabSurface(surface: SurfaceId): boolean {
+	return surface.startsWith("panel-right:") || surface.startsWith("panel-bottom:");
+}
+
+/** The CSS/data-attribute token of a surface (tab titles carry arbitrary
+ * characters, so tab surfaces use a stable hash). */
+function surfaceToken(surface: SurfaceId): string {
+	return isTabSurface(surface) ? `tab-${surfaceHash(surface)}` : surface;
 }
 
 export class BackgroundService {
 	private ctx: BackgroundCtx;
 	private state: BackgroundState;
-	private index = perArea<number>(() => 0);
-	private elapsed = perArea<number>(() => 0);
+	/** The current surface set: built-in areas + discovered better-sidebar tabs. */
+	private surfaces = new Set<SurfaceId>();
+	/** Tab surface → its paneTab host element (from the last discovery pass). */
+	private tabHosts = new Map<SurfaceId, HTMLElement>();
+	/** Tab surface → tab bar title (display label). */
+	private tabLabels = new Map<SurfaceId, string>();
+	/** Runtime per-surface playback state (lazily created records). */
+	private index: Record<SurfaceId, number> = {};
+	private elapsed: Record<SurfaceId, number> = {};
 	private lastError: string | null = null;
 	private revision = 0;
 	private snapshot: BackgroundSnapshot;
@@ -73,87 +87,118 @@ export class BackgroundService {
 	private objectUrls = new Map<string, string>();
 	/** URL -> preload promise cache (shared across prewarm/switch). */
 	private preloadCache = new Map<string, Promise<boolean>>();
-	/** Currently visible layer per area. */
-	private activeLayer = perArea<LayerIndex>(() => 0);
-	/** Layer elements projected at least once (painted or explicitly hidden).
-	 * A freshly created element has no inline opacity, so the CSS default
-	 * opacity 1 plus its fallback background-color would cover the pair
-	 * until the service initializes it. */
+	/** Currently visible layer per surface. */
+	private activeLayer: Record<SurfaceId, LayerIndex> = {};
+	/** Layer elements projected at least once (painted or explicitly hidden). */
 	private projectedLayers = new WeakSet<HTMLElement>();
-	/** Last media painted per area (same-media compare for no-fade repaints). */
-	private lastPainted = perArea<ImageConfig | undefined | null>(() => null);
-	private paintedOnce = perArea<boolean>(() => false);
-	private fadeTimers = perArea<ReturnType<typeof setTimeout> | undefined>(() => undefined);
-	/** Running WAAPI fade animations per area per layer (cancelled on
+	/** Last media painted per surface (same-media compare for no-fade repaints). */
+	private lastPainted: Record<SurfaceId, ImageConfig | undefined | null> = {};
+	private paintedOnce: Record<SurfaceId, boolean> = {};
+	private fadeTimers: Record<SurfaceId, ReturnType<typeof setTimeout> | undefined> = {};
+	/** Running WAAPI fade animations per LAYER ELEMENT id (cancelled on
 	 * retarget so a newer switch can take over mid-fade). */
-	private layerAnims = perArea<[Animation | null, Animation | null]>(() => [null, null]);
-	/** A switch is in flight per area (preload + crossfade). */
-	private switching = perArea<boolean>(() => false);
+	private layerAnims = new Map<string, Animation | null>();
+	/** Cached geometry signature per merged group (repaints on change). */
+	private groupGeometryCache = new Map<SurfaceId, string>();
+	/** A switch is in flight per surface (preload + crossfade). */
+	private switching: Record<SurfaceId, boolean> = {};
 	/** User-requested target index while a switch is in flight. */
-	private pendingTarget = perArea<number | undefined>(() => undefined);
+	private pendingTarget: Record<SurfaceId, number | undefined> = {};
 	/** Next image already prewarmed (half-interval lookahead). */
-	private prewarmed = perArea<boolean>(() => false);
+	private prewarmed: Record<SurfaceId, boolean> = {};
+	/** Which surfaces' hosts exist right now. */
+	private available: Record<SurfaceId, boolean> = {};
+	/** Last painted merged-canvas geometry per group (slot -> slice, or null
+	 * when no member was visible), so the observer can detect layout changes
+	 * (tab switch, panel resize) that require recomputing the slices. */
+	private lastGeometry = new Map<SurfaceId, Map<string, { w: number; h: number; dx: number; dy: number }> | null>();
 
 	constructor(ctx: BackgroundCtx) {
 		this.ctx = ctx;
 		this.state = restoreState();
+		this.refreshSurfaces();
+		this.available = this.computeAvailability();
 		this.snapshot = Object.freeze(this.buildSnapshot());
 		ctx.effect(() => {
-			for (const area of AREAS) {
-				this.ensureLayer(area, 0);
-				this.ensureLayer(area, 1);
-			}
 			this.applyDom();
 			/* The plugin boots before the shell settles: #root still holds the
 			 * loading screen, so column layers land on the wrong host. Watch the
 			 * body, but ONLY re-anchor + re-paint when a layer is actually
-			 * missing or on the wrong host — a full re-paint on every DOM churn
-			 * would race the async file-media paints below. */
+			 * missing, on the wrong host, or misplaced — a full re-paint on
+			 * every DOM churn would race the async file-media paints below. */
 			let scheduled = false;
 			const reapply = () => {
 				if (scheduled) return;
 				scheduled = true;
 				requestAnimationFrame(() => {
 					scheduled = false;
+					this.refreshSurfaces();
 					let needsRepaint = false;
-					for (const area of AREAS) {
-						const host = this.areaHost(area);
-						if (host !== null && !this.layersPlaced(area, host)) {
-							needsRepaint = true;
-							break;
-						}
-						for (const which of [0, 1] as const) {
-							const el = document.getElementById(this.layerId(area, which));
-							if (el === null || host === null || el.parentNode !== host) {
+					for (const surface of this.surfaces) {
+						for (const slot of this.surfaceSlots(surface)) {
+							const host = slot.host;
+							// Host not present yet (boot window, closed tab, closed
+							// settings dialog): the availability sync reports it to
+							// the UI — and the surface's on-marker must flip OFF,
+							// or our transparency/lift CSS leaks onto whatever
+							// unrelated dialog appears next.
+							if (host === null) {
+								this.markSlotGone(surface, slot.slot);
+								continue;
+							}
+							if (!this.layersPlaced(surface, slot.slot, host)) {
 								needsRepaint = true;
 								break;
 							}
-							if (area === "sidebar") {
-								// Sidebar layers lead the column in fixed order
-								// (a, then b, then content) — see ensureLayer.
-								const lead = which === 0 ? null : document.getElementById(this.layerId(area, 0));
-								if (el.previousElementSibling !== (lead ?? null)) {
+							for (const which of [0, 1] as const) {
+								const el = document.getElementById(this.layerId(surface, slot.slot, which));
+								if (el === null || el.parentNode !== host) {
 									needsRepaint = true;
 									break;
 								}
+								if (surface === "sidebar" && slot.slot === "") {
+									// Sidebar layers lead the column in fixed order
+									// (a, then b, then content) — see ensureLayer.
+									const lead = which === 0 ? null : document.getElementById(this.layerId(surface, "", 0));
+									if (el.previousElementSibling !== (lead ?? null)) {
+										needsRepaint = true;
+										break;
+									}
+								}
 							}
 						}
+						// Merged-canvas slices are px-anchored: a tab switch,
+						// panel collapse or any layout change that moved a member
+						// must recompute them (layers themselves stay in place,
+						// so the checks above cannot see it).
+						if (!needsRepaint && surface.startsWith("group:") && this.groupGeometryStale(surface)) {
+							needsRepaint = true;
+						}
 					}
+					if (this.syncAvailability()) needsRepaint = true;
 					if (needsRepaint) this.applyDom();
 				});
 			};
 			const observer = new MutationObserver(reapply);
-			observer.observe(document.body, { childList: true, subtree: true });
+			// childList catches hosts appearing/disappearing; the attribute
+			// filter catches tab activation/panel resizes that flip
+			// class/style/hidden without structural changes.
+			observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ["class", "style", "hidden"] });
+			const onResize = () => reapply();
+			window.addEventListener?.("resize", onResize);
 			const timer = setInterval(() => this.tick(), TICK_MS);
 			return () => {
 				clearInterval(timer);
 				observer.disconnect();
-				for (const area of AREAS) {
-					this.cancelLayerFade(area, 0);
-					this.cancelLayerFade(area, 1);
-					this.removeLayer(area, 0);
-					this.removeLayer(area, 1);
-					if (this.fadeTimers[area] !== undefined) clearTimeout(this.fadeTimers[area]);
+				window.removeEventListener?.("resize", onResize);
+				for (const surface of [...this.surfaces]) {
+					for (const slot of this.surfaceSlots(surface)) {
+						for (const which of [0, 1] as const) {
+							this.cancelLayerFade(this.layerId(surface, slot.slot, which));
+							this.removeLayer(surface, slot.slot, which);
+						}
+					}
+					if (this.fadeTimers[surface] !== undefined) clearTimeout(this.fadeTimers[surface]);
 				}
 				for (const url of this.objectUrls.values()) URL.revokeObjectURL(url);
 				this.objectUrls.clear();
@@ -167,14 +212,15 @@ export class BackgroundService {
 		return this.snapshot;
 	}
 
-	/** Append image configs to an area (non-empty additions enable it). A
+	/** Append image configs to a surface (non-empty additions enable it). A
 	 * group holds ONE media kind: images switch like a slideshow, videos
 	 * play — mixing the two is not supported. Mixed batches are filtered to
-	 * the group's kind (an empty area adopts the batch's kind, preferring
+	 * the group's kind (an empty surface adopts the batch's kind, preferring
 	 * images when the batch itself is mixed) and the skipped count is
 	 * reported to the editor. */
-	addImages(area: AreaId, images: ImageConfig[]): AddImagesResult {
-		const cfg = this.state.areas[area];
+	addImages(surface: SurfaceId, images: ImageConfig[]): AddImagesResult {
+		this.ensureSurfaceRecords(surface);
+		const cfg = this.cfgOf(surface);
 		const valid = images.filter((img) =>
 			(img.source === "url" && img.url !== "") || (img.source === "file" && img.fileId !== "")
 		);
@@ -197,23 +243,25 @@ export class BackgroundService {
 		};
 	}
 
-	/** Remove one image from an area (also drops its stored blob, if local). */
-	removeImage(area: AreaId, index: number): void {
-		const cfg = this.state.areas[area];
+	/** Remove one image from a surface (also drops its stored blob, if local). */
+	removeImage(surface: SurfaceId, index: number): void {
+		const cfg = this.state.areas[surface];
+		if (cfg === undefined) return;
 		if (index < 0 || index >= cfg.images.length) return;
 		const [removed] = cfg.images.splice(index, 1);
 		if (removed.source === "file") {
 			deleteStoredFile(removed.fileId);
 			this.revokeFileUrl(removed.fileId);
 		}
-		if (this.index[area] >= cfg.images.length) this.index[area] = cfg.images.length === 0 ? 0 : cfg.images.length - 1;
+		if (this.index[surface] >= cfg.images.length) this.index[surface] = cfg.images.length === 0 ? 0 : cfg.images.length - 1;
 		if (cfg.images.length === 0) cfg.enabled = false;
 		this.publish();
 	}
 
 	/** Patch one image's configuration (immutable update). */
-	updateImage(area: AreaId, index: number, patch: Partial<ImageConfig>): void {
-		const cfg = this.state.areas[area];
+	updateImage(surface: SurfaceId, index: number, patch: Partial<ImageConfig>): void {
+		const cfg = this.state.areas[surface];
+		if (cfg === undefined) return;
 		if (index < 0 || index >= cfg.images.length) return;
 		const img = cfg.images[index];
 		const next: ImageConfig = { ...img, ...patch };
@@ -232,47 +280,49 @@ export class BackgroundService {
 		this.publish();
 	}
 
-	/** Toggle an area's background on/off. */
-	setEnabled(area: AreaId, enabled: boolean): void {
-		const cfg = this.state.areas[area];
+	/** Toggle a surface's background on/off. */
+	setEnabled(surface: SurfaceId, enabled: boolean): void {
+		const cfg = this.cfgOf(surface);
 		if (cfg.enabled === enabled) return;
 		cfg.enabled = enabled;
-		this.elapsed[area] = 0;
+		this.elapsed[surface] = 0;
 		this.publish();
 	}
 
 	/** Set the slideshow interval in seconds (0 stops playback). */
-	setIntervalSec(area: AreaId, seconds: number): void {
-		const cfg = this.state.areas[area];
+	setIntervalSec(surface: SurfaceId, seconds: number): void {
+		const cfg = this.cfgOf(surface);
 		const next = clamp(Number(seconds) || 0, 0, 3600);
 		if (cfg.intervalSec === next) return;
 		cfg.intervalSec = next;
-		this.elapsed[area] = 0;
+		this.elapsed[surface] = 0;
 		this.publish();
 	}
 
 	/** Toggle order vs random playback. */
-	setRandom(area: AreaId, random: boolean): void {
-		const cfg = this.state.areas[area];
+	setRandom(surface: SurfaceId, random: boolean): void {
+		const cfg = this.cfgOf(surface);
 		if (cfg.random === random) return;
 		cfg.random = random;
-		this.elapsed[area] = 0;
+		this.elapsed[surface] = 0;
 		this.publish();
 	}
 
-	/** Manually step to the next image. A single-image area has no "next" —
-	 * nothing switches, no fade fires (the UI disables the button too). */
-	next(area: AreaId): void {
-		const cfg = this.state.areas[area];
-		if (cfg.images.length < 2) return;
-		this.requestSwitch(area);
+	/** Manually step to the next image. A single-image surface has no
+	 * "next" — nothing switches, no fade fires (the UI disables the button
+	 * too). */
+	next(surface: SurfaceId): void {
+		const cfg = this.state.areas[surface];
+		if (cfg === undefined || cfg.images.length < 2) return;
+		this.requestSwitch(surface);
 	}
 
 	/** Show a specific image (selecting a strip thumbnail previews it). */
-	showImage(area: AreaId, index: number): void {
-		const cfg = this.state.areas[area];
+	showImage(surface: SurfaceId, index: number): void {
+		const cfg = this.state.areas[surface];
+		if (cfg === undefined) return;
 		if (index < 0 || index >= cfg.images.length) return;
-		this.requestSwitch(area, index);
+		this.requestSwitch(surface, index);
 	}
 
 	/** Resolve an image's display URL. File images load lazily from IndexedDB
@@ -300,6 +350,186 @@ export class BackgroundService {
 			this.objectUrls.delete(fileId);
 		}
 	}
+
+	//#region surface discovery
+
+	/** True when the element carries a CSS-module class whose local name
+	 * ends with `suffix` (e.g. `_paneContent`). Hash prefixes vary per
+	 * better-sidebar build, local names do not. */
+	private hasClass(el: Element, suffix: string): boolean {
+		for (const name of Array.from(el.classList)) {
+			if (name.endsWith(suffix)) return true;
+		}
+		return false;
+	}
+
+	/** Resolve one better-sidebar panel host and mark it for the CSS. The
+	 * panels are fixed-position direct children of the plugin's mount host
+	 * ([data-dsh-better-sidebar] on body): the right panel carries an inline
+	 * width, the bottom panel an inline height. Returns null while that
+	 * plugin is absent — original-dsh profiles see no layers here. */
+	private betterPanelHost(kind: "right" | "bottom"): HTMLElement | null {
+		const host = document.querySelector("[data-dsh-better-sidebar]");
+		if (!(host instanceof HTMLElement)) return null;
+		for (const child of Array.from(host.children)) {
+			if (!(child instanceof HTMLElement)) continue;
+			const widthSet = child.style.width !== "" && child.style.width !== undefined;
+			const heightSet = child.style.height !== "" && child.style.height !== undefined;
+			if (kind === "bottom" && heightSet) {
+				child.setAttribute("data-dsh-bg-panel", "bottom");
+				return child;
+			}
+			if (kind === "right" && widthSet && !heightSet) {
+				child.setAttribute("data-dsh-bg-panel", "right");
+				return child;
+			}
+		}
+		return null;
+	}
+
+	/** Discover every better-sidebar tab surface: for each pane, the tab-bar
+	 * items (in order) name the pane's content divs (same order — both render
+	 * pane.tabs in order), so tab i's content div hosts the surface
+	 * `panel-<kind>:<tabTitle>`. Content divs get tagged with
+	 * `data-dshbg-tab-surface` for the CSS. Tab items are looked up ONLY
+	 * inside the pane's tab bar (class suffix `_tabBar`) — tab CONTENT can
+	 * carry its own title-bearing elements, which must never pollute the
+	 * naming. */
+	private discoverTabSurfaces(): Map<SurfaceId, { host: HTMLElement; label: string }> {
+		const out = new Map<SurfaceId, { host: HTMLElement; label: string }>();
+		for (const kind of ["right", "bottom"] as const) {
+			const panel = this.betterPanelHost(kind);
+			if (panel === null) continue;
+			const panes: HTMLElement[] = [];
+			for (const el of panel.querySelectorAll("*")) {
+				if (el instanceof HTMLElement && this.hasClass(el, "_paneContent")) panes.push(el);
+			}
+			for (const pane of panes) {
+				const paneEl = pane.parentElement;
+				const tabItems: HTMLElement[] = [];
+				if (paneEl instanceof HTMLElement) {
+					for (const el of paneEl.querySelectorAll("[title]")) {
+						if (el instanceof HTMLElement && this.hasClass(el, "_tab") && this.insideTabBar(el)) {
+							tabItems.push(el);
+						}
+					}
+				}
+				let i = 0;
+				for (const child of Array.from(pane.children)) {
+					if (!(child instanceof HTMLElement) || !this.hasClass(child, "_paneTab")) continue;
+					const title = tabItems[i]?.getAttribute("title") ?? "";
+					i += 1;
+					if (title === "") continue;
+					const key: SurfaceId = `panel-${kind}:${title}`;
+					child.setAttribute("data-dshbg-tab-surface", key);
+					out.set(key, { host: child, label: title });
+				}
+			}
+		}
+		return out;
+	}
+
+	/** True when the element sits inside a tab bar (an ancestor carries a
+	 * class whose local name ends with `_tabBar`). */
+	private insideTabBar(el: HTMLElement): boolean {
+		let node: HTMLElement | null = el;
+		while (node !== null && node !== document.body) {
+			if (this.hasClass(node, "_tabBar")) return true;
+			node = node.parentElement;
+		}
+		return false;
+	}
+
+	/** Rebuild the current surface set from the built-in areas plus the
+	 * discovered tabs. Returns whether the set changed. */
+	private refreshSurfaces(): boolean {
+		const found = this.discoverTabSurfaces();
+		const next = new Set<SurfaceId>(AREAS as readonly string[]);
+		for (const key of found.keys()) next.add(key);
+		for (const group of this.state.groups) next.add(group.id);
+		let changed = next.size !== this.surfaces.size;
+		if (!changed) {
+			for (const surface of next) {
+				if (!this.surfaces.has(surface)) {
+					changed = true;
+					break;
+				}
+			}
+		}
+		this.surfaces = next;
+		this.tabHosts = new Map();
+		this.tabLabels = new Map();
+		for (const [key, entry] of found) {
+			this.tabHosts.set(key, entry.host);
+			this.tabLabels.set(key, entry.label);
+		}
+		return changed;
+	}
+
+	/** Every surface the snapshot should carry: the ones present now plus any
+	 * persisted config (a closed tab keeps its config visible — grayed in
+	 * the UI — so it can be edited or cleaned up before the tab reopens). */
+	private allSurfaces(): Set<SurfaceId> {
+		return new Set([...this.surfaces, ...Object.keys(this.state.areas)]);
+	}
+
+	/** Current availability of every surface's host. */
+	private computeAvailability(): Record<SurfaceId, boolean> {
+		const rec: Record<SurfaceId, boolean> = {};
+		for (const surface of this.allSurfaces()) {
+			if (surface.startsWith("group:")) {
+				rec[surface] = this.surfaceSlots(surface).some((slot) => slot.host !== null);
+			} else {
+				rec[surface] = isTabSurface(surface) ? this.tabHosts.has(surface) : true;
+			}
+		}
+		return rec;
+	}
+
+	/** Re-check availability and republish the snapshot when the set changed
+	 * (better-sidebar tabs come and go without any state change). Returns
+	 * whether the availability changed (callers may need a repaint). */
+	private syncAvailability(): boolean {
+		const next = this.computeAvailability();
+		let changed = false;
+		for (const surface of this.allSurfaces()) {
+			if (this.available[surface] !== next[surface]) {
+				changed = true;
+				break;
+			}
+		}
+		if (!changed) return false;
+		this.available = next;
+		this.snapshot = Object.freeze(this.buildSnapshot());
+		this.ctx.emit("background/change", this.snapshot);
+		return true;
+	}
+
+	/** The persisted config of a surface, created on first touch. */
+	private cfgOf(surface: SurfaceId): AreaConfig {
+		let cfg = this.state.areas[surface];
+		if (cfg === undefined) {
+			cfg = { ...DEFAULT_AREA, images: [] };
+			this.state.areas[surface] = cfg;
+		}
+		return cfg;
+	}
+
+	/** Lazily create a surface's runtime playback records. */
+	private ensureSurfaceRecords(surface: SurfaceId): void {
+		if (this.index[surface] !== undefined) return;
+		this.index[surface] = 0;
+		this.elapsed[surface] = 0;
+		this.activeLayer[surface] = 0;
+		this.lastPainted[surface] = null;
+		this.paintedOnce[surface] = false;
+		this.fadeTimers[surface] = undefined;
+		this.switching[surface] = false;
+		this.pendingTarget[surface] = undefined;
+		this.prewarmed[surface] = false;
+	}
+
+	//#endregion
 
 	//#region playback + preloaded switching
 
@@ -332,86 +562,222 @@ export class BackgroundService {
 	}
 
 	/** Prewarm the next image half an interval early (bytes + ready cache). */
-	private prewarm(area: AreaId): void {
-		const cfg = this.state.areas[area];
-		if (!cfg.enabled || cfg.images.length < 2) return;
-		const nextIndex = this.nextIndex(area, cfg.images.length);
+	private prewarm(surface: SurfaceId): void {
+		const cfg = this.state.areas[surface];
+		if (cfg === undefined || !cfg.enabled || cfg.images.length < 2) return;
+		const nextIndex = this.nextIndex(surface, cfg.images.length);
 		void this.preload(cfg.images[nextIndex]);
 	}
 
 	/** Compute the next playback index (order or random). */
-	private nextIndex(area: AreaId, count: number): number {
-		const cfg = this.state.areas[area];
+	private nextIndex(surface: SurfaceId, count: number): number {
+		const cfg = this.state.areas[surface];
 		if (count < 2) return 0;
 		if (cfg.random) {
 			let pick: number;
 			do {
 				pick = Math.floor(Math.random() * count);
-			} while (pick === this.index[area] && count > 1);
+			} while (pick === this.index[surface] && count > 1);
 			return pick;
 		}
-		return (this.index[area] + 1) % count;
+		return (this.index[surface] + 1) % count;
 	}
 
 	/** Queue a switch (to a specific image, or the next one). */
-	private requestSwitch(area: AreaId, targetIndex?: number): void {
-		this.pendingTarget[area] = targetIndex ?? this.pendingTarget[area];
-		if (!this.switching[area]) void this.performSwitch(area);
+	private requestSwitch(surface: SurfaceId, targetIndex?: number): void {
+		this.pendingTarget[surface] = targetIndex ?? this.pendingTarget[surface];
+		if (!this.switching[surface]) void this.performSwitch(surface);
 	}
 
 	/** Preload the target media, then commit the index (crossfade lands via
 	 * publish → applyArea). Waits for the load even past the scheduled time;
 	 * a failed load keeps the current image until the next attempt. */
-	private async performSwitch(area: AreaId): Promise<void> {
-		if (this.switching[area]) return;
-		this.switching[area] = true;
+	private async performSwitch(surface: SurfaceId): Promise<void> {
+		if (this.switching[surface]) return;
+		this.switching[surface] = true;
 		try {
 			while (true) {
-				const target = this.pendingTarget[area];
-				this.pendingTarget[area] = undefined;
-				const cfg = this.state.areas[area];
-				if (!cfg.enabled || cfg.images.length === 0) break;
-				const nextIndex = target !== undefined ? target : this.nextIndex(area, cfg.images.length);
-				if (nextIndex === this.index[area] && target === undefined) break;
+				const target = this.pendingTarget[surface];
+				this.pendingTarget[surface] = undefined;
+				const cfg = this.state.areas[surface];
+				if (cfg === undefined || !cfg.enabled || cfg.images.length === 0) break;
+				const nextIndex = target !== undefined ? target : this.nextIndex(surface, cfg.images.length);
+				if (nextIndex === this.index[surface] && target === undefined) break;
 				const ok = await this.preload(cfg.images[nextIndex]);
 				if (!ok) break; // media unavailable: stay on the current one
-				if (this.index[area] !== nextIndex) {
-					this.index[area] = nextIndex;
-					this.elapsed[area] = 0;
-					this.prewarmed[area] = false;
+				if (this.index[surface] !== nextIndex) {
+					this.index[surface] = nextIndex;
+					this.elapsed[surface] = 0;
+					this.prewarmed[surface] = false;
 					this.publish(); // → applyDom → applyArea → crossfade
 				}
-				if (this.pendingTarget[area] === undefined) break;
+				if (this.pendingTarget[surface] === undefined) break;
 			}
 		} finally {
-			this.switching[area] = false;
+			this.switching[surface] = false;
 		}
 	}
 
 	/** Slideshow heartbeat: prewarm at half interval, switch at the interval
-	 * (the switch itself waits for the preload — the interval may overrun). */
+	 * (the switch itself waits for the preload — the interval may overrun).
+	 * Merged groups also re-check their canvas geometry here: when members
+	 * moved or resized, the slices repaint so the shared image stays
+	 * continuous (dragging only mutates inline styles — no DOM churn). */
 	private tick(): void {
-		for (const area of AREAS) {
-			const cfg = this.state.areas[area];
-			if (!cfg.enabled || cfg.images.length < 2 || cfg.intervalSec <= 0) continue;
-			this.elapsed[area] += TICK_MS;
-			if (this.elapsed[area] >= cfg.intervalSec * 500 && !this.prewarmed[area]) {
-				this.prewarmed[area] = true;
-				this.prewarm(area);
+		for (const surface of this.surfaces) {
+			const cfg = this.state.areas[surface];
+			if (surface.startsWith("group:") && cfg !== undefined && cfg.enabled && cfg.images.length > 0) {
+				this.refreshGroupGeometry(surface);
 			}
-			if (this.elapsed[area] >= cfg.intervalSec * 1000) {
-				this.elapsed[area] = 0;
-				this.prewarmed[area] = false;
-				this.requestSwitch(area);
+			if (cfg === undefined || !cfg.enabled || cfg.images.length < 2 || cfg.intervalSec <= 0) continue;
+			this.elapsed[surface] += TICK_MS;
+			if (this.elapsed[surface] >= cfg.intervalSec * 500 && !this.prewarmed[surface]) {
+				this.prewarmed[surface] = true;
+				this.prewarm(surface);
+			}
+			if (this.elapsed[surface] >= cfg.intervalSec * 1000) {
+				this.elapsed[surface] = 0;
+				this.prewarmed[surface] = false;
+				this.requestSwitch(surface);
 			}
 		}
 	}
 
-	/** Current image config for an area (undefined when off or unset). */
-	currentImage(area: AreaId): ImageConfig | undefined {
-		const cfg = this.state.areas[area];
-		if (!cfg.enabled || cfg.images.length === 0) return undefined;
-		return cfg.images[this.index[area] % cfg.images.length];
+	/** Repaint a merged group when its member rectangles moved (canvas
+	 * geometry changed since the last paint). */
+	private refreshGroupGeometry(surface: SurfaceId): void {
+		const geometry = this.groupGeometryOf(surface);
+		if (geometry === null) return;
+		const signature = [...geometry.entries()].map(([slot, g]) => `${slot}:${g.w},${g.h},${g.dx},${g.dy}`).join("|");
+		if (this.groupGeometryCache.get(surface) === signature) return;
+		this.groupGeometryCache.set(surface, signature);
+		void this.applyArea(surface);
+	}
+
+	/** Merge several standalone surfaces into one logical surface: the
+	 * shared media paints across every member as a single continuous canvas
+	 * (multi-monitor wallpaper strategy). Members keep their own configs but
+	 * stop painting on their own while merged. */
+	mergeSurfaces(members: SurfaceId[]): SurfaceId | null {
+		const valid = members.filter((member) =>
+			!member.startsWith("group:")
+			&& !this.state.groups.some((g) => g.members.includes(member))
+			&& (AREAS as readonly string[]).includes(member as (typeof AREAS)[number]) ? true : isTabSurface(member)
+		);
+		if (valid.length < 2) return null;
+		let n = 0;
+		for (const group of this.state.groups) {
+			const match = group.id.match(/^group:(\d+)$/);
+			if (match !== null) n = Math.max(n, Number(match[1]));
+		}
+		const id: SurfaceId = `group:${n + 1}`;
+		this.state.groups = [...this.state.groups, { id, members: [...valid] }];
+		this.cfgOf(id);
+		// The group owns the members while merged: their own backgrounds stop
+		// painting (their configs stay for the unmerge fallback).
+		for (const member of valid) this.cfgOf(member).enabled = false;
+		this.publish();
+		return id;
+	}
+
+	/** Add one standalone surface to an existing merged group (dragging a
+	 * row onto a group row). The newcomer stops painting on its own; its own
+	 * config is kept for when it leaves again. Group entries are replaced
+	 * immutably — the members array must never be mutated in place (it may
+	 * have been frozen through snapshot sharing). */
+	addMemberToGroup(groupId: SurfaceId, member: SurfaceId): void {
+		const at = this.state.groups.findIndex((g) => g.id === groupId);
+		if (at === -1) return;
+		if (member.startsWith("group:")) return;
+		const group = this.state.groups[at];
+		if (group.members.includes(member)) return;
+		if (this.state.groups.some((g) => g.members.includes(member))) return;
+		this.state.groups = [
+			...this.state.groups.slice(0, at),
+			{ id: group.id, members: [...group.members, member] },
+			...this.state.groups.slice(at + 1)
+		];
+		this.cfgOf(member).enabled = false;
+		this.publish();
+	}
+
+	/** Remove one member from a merged group (chip × or drag-out). The
+	 * member goes back to its own pre-merge config; a group that drops below
+	 * two members dissolves — the last member inherits the group's media
+	 * (the shared canvas no longer spans anything). */
+	removeMemberFromGroup(groupId: SurfaceId, member: SurfaceId): void {
+		const at = this.state.groups.findIndex((g) => g.id === groupId);
+		if (at === -1) return;
+		const group = this.state.groups[at];
+		if (!group.members.includes(member)) return;
+		const members = group.members.filter((m) => m !== member);
+		this.state.groups = [
+			...this.state.groups.slice(0, at),
+			{ id: group.id, members },
+			...this.state.groups.slice(at + 1)
+		];
+		const own = this.state.areas[member];
+		if (own !== undefined) own.enabled = own.images.length > 0;
+		if (members.length < 2) {
+			// Dissolve: the last member keeps the group's media.
+			this.state.groups = this.state.groups.filter((g) => g.id !== groupId);
+			this.lastGeometry.delete(groupId);
+			const cfg = this.state.areas[groupId];
+			if (cfg !== undefined && members.length === 1) {
+				const last = this.cfgOf(members[0]);
+				last.images = cfg.images.map((img) => ({ ...img }));
+				last.enabled = cfg.enabled;
+				last.intervalSec = cfg.intervalSec;
+				last.random = cfg.random;
+			}
+			delete this.state.areas[groupId];
+		}
+		this.publish();
+	}
+
+	/** Clear a surface's media entirely (also drops stored local blobs). */
+	clearSurface(surface: SurfaceId): void {
+		const cfg = this.state.areas[surface];
+		if (cfg === undefined || cfg.images.length === 0) return;
+		for (const img of cfg.images) {
+			if (img.source === "file") {
+				deleteStoredFile(img.fileId);
+				this.revokeFileUrl(img.fileId);
+			}
+		}
+		cfg.images = [];
+		cfg.enabled = false;
+		this.index[surface] = 0;
+		this.elapsed[surface] = 0;
+		this.publish();
+	}
+
+	/** Dissolve a merged group: the group's media lands on every member
+	 * (each becomes standalone again with its own copy). */
+	unmerge(groupId: SurfaceId): void {
+		const group = this.state.groups.find((g) => g.id === groupId);
+		if (group === undefined) return;
+		this.state.groups = this.state.groups.filter((g) => g.id !== groupId);
+		this.lastGeometry.delete(groupId);
+		const cfg = this.state.areas[groupId];
+		if (cfg !== undefined) {
+			for (const member of group.members) {
+				const memberCfg = this.cfgOf(member);
+				memberCfg.images = cfg.images.map((img) => ({ ...img }));
+				memberCfg.enabled = cfg.enabled;
+				memberCfg.intervalSec = cfg.intervalSec;
+				memberCfg.random = cfg.random;
+			}
+			delete this.state.areas[groupId];
+		}
+		this.publish();
+	}
+
+	/** Current image config for a surface (undefined when off or unset). */
+	currentImage(surface: SurfaceId): ImageConfig | undefined {
+		const cfg = this.state.areas[surface];
+		if (cfg === undefined || !cfg.enabled || cfg.images.length === 0) return undefined;
+		return cfg.images[this.index[surface] % cfg.images.length];
 	}
 
 	//#endregion
@@ -422,41 +788,97 @@ export class BackgroundService {
 		this.revision += 1;
 		if (!persistState(this.state)) this.lastError = "quota";
 		else this.lastError = null;
+		// Refresh the surface set BEFORE snapshotting: a just-dissolved group
+		// (or a just-created one) must not leak a stale default entry into
+		// the snapshot.
+		this.refreshSurfaces();
 		this.snapshot = Object.freeze(this.buildSnapshot());
 		this.applyDom();
 		this.ctx.emit("background/change", this.snapshot);
 	}
 
-	/** Immutable snapshot: per-area config + playback index. Images are
-	 * deep-copied — the settings store's immer updates freeze whatever they
-	 * receive, which must never be the live service state. */
+	/** Immutable snapshot: per-surface config + playback index + metadata.
+	 * Images are deep-copied — the settings store's immer updates freeze
+	 * whatever they receive, which must never be the live service state. */
 	private buildSnapshot(): BackgroundSnapshot {
 		const areas = {} as BackgroundSnapshot["areas"];
-		for (const area of AREAS) {
-			areas[area] = {
-				...this.state.areas[area],
-				images: this.state.areas[area].images.map((img) => ({ ...img }))
+		const index = {} as BackgroundSnapshot["index"];
+		const meta = {} as BackgroundSnapshot["meta"];
+		for (const surface of this.allSurfaces()) {
+			const cfg = this.state.areas[surface] ?? { ...DEFAULT_AREA, images: [] };
+			areas[surface] = {
+				...cfg,
+				images: cfg.images.map((img) => ({ ...img }))
 			};
+			index[surface] = this.index[surface] ?? 0;
+			meta[surface] = this.metaOf(surface);
 		}
 		return {
 			areas,
-			index: { ...this.index },
+			index,
+			meta,
+			groups: this.state.groups.map((g) => ({ id: g.id, members: [...g.members] })),
 			lastError: this.lastError,
 			revision: this.revision
 		};
+	}
+
+	/** Display metadata of a surface. */
+	private metaOf(surface: SurfaceId): SurfaceMeta {
+		if (surface.startsWith("group:")) {
+			const group = this.state.groups.find((g) => g.id === surface);
+			return {
+				label: "group",
+				group: "group",
+				available: this.available[surface] ?? false,
+				// Copy: the snapshot reaches the settings store, whose immer
+				// deep-freezes everything it touches — a shared live array
+				// here would freeze the service's own group.members and break
+				// every later push/splice ("object is not extensible").
+				members: group !== undefined ? [...group.members] : []
+			};
+		}
+		const memberOf = this.state.groups.find((g) => g.members.includes(surface))?.id;
+		if (surface.startsWith("panel-right:")) {
+			return { label: this.tabLabels.get(surface) ?? surface.slice("panel-right:".length), group: "panel-right", available: this.available[surface] ?? false, memberOf };
+		}
+		if (surface.startsWith("panel-bottom:")) {
+			return { label: this.tabLabels.get(surface) ?? surface.slice("panel-bottom:".length), group: "panel-bottom", available: this.available[surface] ?? false, memberOf };
+		}
+		return { label: surface, group: "builtin", available: true, memberOf };
 	}
 
 	//#endregion
 
 	//#region DOM projection (layer pairs + crossfade)
 
-	private layerId(area: AreaId, which: LayerIndex): string {
-		return `dsh-bg-layer-${area}-${which === 0 ? "a" : "b"}`;
+	/** One projection slot: a (host, key) pair. Non-group surfaces have one
+	 * slot (empty key); merged groups have one slot PER member surface — the
+	 * same media paints on every member as a slice of the shared canvas. */
+	private surfaceSlots(surface: SurfaceId): Array<{ slot: string; host: HTMLElement | null }> {
+		if (!surface.startsWith("group:")) {
+			return [{ slot: "", host: this.areaHost(surface) }];
+		}
+		const group = this.state.groups.find((g) => g.id === surface);
+		if (group === undefined) return [];
+		const slots: Array<{ slot: string; host: HTMLElement | null }> = [];
+		for (const member of group.members) {
+			if (member.startsWith("group:")) continue; // nested groups are never created
+			slots.push({ slot: surfaceToken(member), host: this.areaHost(member) });
+		}
+		return slots;
 	}
 
-	/** Whether the host's children satisfy the area's placement invariant:
- * sidebar layers lead the column; every other area's layers trail it. */
-	private layersPlaced(area: AreaId, host: HTMLElement): boolean {
+	private layerId(surface: SurfaceId, slot: string, which: LayerIndex): string {
+		const token = surfaceToken(surface);
+		const suffix = which === 0 ? "a" : "b";
+		return slot === "" ? `dsh-bg-layer-${token}-${suffix}` : `dsh-bg-layer-${token}-${slot}-${suffix}`;
+	}
+
+	/** Whether the host's children satisfy the placement invariant: the
+	 * sidebar's own layers lead the column; every other layer trails it. */
+	private layersPlaced(surface: SurfaceId, slot: string, host: HTMLElement): boolean {
+		const leads = surface === "sidebar" && slot === "";
 		let sawLayer = false;
 		let sawContent = false;
 		for (const child of Array.from(host.children)) {
@@ -464,14 +886,15 @@ export class BackgroundService {
 			if (isLayer) sawLayer = true;
 			else sawContent = true;
 			// lead: a layer after content is wrong; trail: content after a layer is wrong
-			if (isLayer ? area === "sidebar" && sawContent : area !== "sidebar" && sawLayer) return false;
+			if (isLayer ? leads && sawContent : !leads && sawLayer) return false;
 		}
 		return true;
 	}
 
-	/** The DOM host each area's layers mount into. */
-	private areaHost(area: AreaId): HTMLElement | null {
-		switch (area) {
+	/** The DOM host a surface's layers mount into. */
+	private areaHost(surface: SurfaceId): HTMLElement | null {
+		if (isTabSurface(surface)) return this.tabHosts.get(surface) ?? null;
+		switch (surface) {
 			case "sidebar": {
 				// The column is the settings trigger's ancestor whose parent
 				// holds the conversation surface. Slot outlets are wrapped in
@@ -495,29 +918,38 @@ export class BackgroundService {
 			case "trajectory":
 				return document.querySelector("[data-conversation-composer-overlay]");
 			case "settings":
-				return document.querySelector('[role="dialog"][aria-modal="true"]');
+				// Only the settings PANEL counts: it carries aria-labelledby,
+				// while the harness Modal primitive (used by better-sidebar's
+				// gear dialogs and others) carries aria-label — the settings
+				// background must not flip onto a transient modal.
+				return document.querySelector('[role="dialog"][aria-modal="true"][aria-labelledby]');
 			default:
 				return null;
 		}
 	}
 
-	/** Create (or re-anchor) one layer element for an area. Layers sit at
+	/** Create (or re-anchor) one layer element for a surface. Layers sit at
 	 * the END of their host; the sidebar is the exception — its layers LEAD
 	 * the column (a, then b, then content) so tree order alone (content
 	 * position:relative, z auto) keeps content above the wallpaper without
 	 * a z-index that would trap the settings dialog inside the wrapper. */
-	private ensureLayer(area: AreaId, which: LayerIndex): HTMLElement {
-		const id = this.layerId(area, which);
-		const host = this.areaHost(area);
+	private ensureLayer(surface: SurfaceId, slot: string, which: LayerIndex): HTMLElement {
+		const id = this.layerId(surface, slot, which);
+		const host = this.surfaceSlots(surface).find((candidate) => candidate.slot === slot)?.host ?? null;
 		let el = document.getElementById(id) as HTMLElement | null;
 		if (el === null) {
 			el = document.createElement("div");
 			el.id = id;
 			el.setAttribute("aria-hidden", "true");
 		}
+		if (surface.startsWith("group:")) {
+			// Group slices clip to their member (the canvas slice may extend
+			// beyond the member's bounds).
+			el.className = "dshbg-slice";
+		}
 		if (host !== null) {
-			if (area === "sidebar") {
-				const lead = which === 0 ? null : document.getElementById(this.layerId(area, 0));
+			if (surface === "sidebar" && slot === "") {
+				const lead = which === 0 ? null : document.getElementById(this.layerId(surface, "", 0));
 				if (el.parentNode !== host || el.previousElementSibling !== (lead ?? null)) {
 					const oldParent = el.parentNode;
 					if (oldParent instanceof HTMLElement && oldParent !== host) oldParent.removeAttribute("data-dshbg-sidebar-host");
@@ -535,27 +967,35 @@ export class BackgroundService {
 		return el;
 	}
 
-	private removeLayer(area: AreaId, which: LayerIndex): void {
-		document.getElementById(this.layerId(area, which))?.remove();
+	private removeLayer(surface: SurfaceId, slot: string, which: LayerIndex): void {
+		document.getElementById(this.layerId(surface, slot, which))?.remove();
 	}
 
 	private resetDom(): void {
 		const root = document.documentElement;
-		for (const area of AREAS) {
-			root.removeAttribute(`data-dsh-bg-${area}`);
+		for (const surface of this.surfaces) {
+			root.removeAttribute(`data-dsh-bg-${surfaceToken(surface)}`);
 		}
 		for (const host of Array.from(document.querySelectorAll("[data-dshbg-sidebar-host]"))) {
 			host.removeAttribute("data-dshbg-sidebar-host");
 		}
+		for (const host of Array.from(document.querySelectorAll("[data-dshbg-tab-surface]"))) {
+			host.removeAttribute("data-dshbg-tab-on");
+		}
 	}
 
-	/** Project all areas onto the DOM (async crossfade paints). */
+	/** Project all surfaces onto the DOM (async crossfade paints). */
 	applyDom(): void {
-		for (const area of AREAS) {
-			this.ensureLayer(area, 0);
-			this.ensureLayer(area, 1);
-			void this.applyArea(area);
+		this.refreshSurfaces();
+		for (const surface of this.surfaces) {
+			this.ensureSurfaceRecords(surface);
+			for (const slot of this.surfaceSlots(surface)) {
+				this.ensureLayer(surface, slot.slot, 0);
+				this.ensureLayer(surface, slot.slot, 1);
+			}
+			void this.applyArea(surface);
 		}
+		this.syncAvailability();
 	}
 
 	/** Two configs denote the same media (no switch, no fade between them). */
@@ -564,26 +1004,36 @@ export class BackgroundService {
 		return a.url === b.url && a.fileId === b.fileId && a.media === b.media;
 	}
 
-	/** One area's projection: when the target media changed, crossfade to it
-	 * (incoming layer fades in while the outgoing one fades out); when it is
-	 * the same media (single-image areas, per-image render tweaks), repaint
-	 * in place without any fade. */
-	private async applyArea(area: AreaId): Promise<void> {
-		const target = this.currentImage(area);
-		if (this.sameMedia(this.lastPainted[area], target)) {
-			this.lastPainted[area] = target !== undefined ? { ...target } : null;
-			if (this.fadeTimers[area] !== undefined) {
+	/** One surface's projection: when the target media changed, crossfade to
+	 * it (incoming layers fade in while the outgoing ones fade out); when it
+	 * is the same media (single-image surfaces, per-image render tweaks),
+	 * repaint in place without any fade. A merged group paints EVERY member
+	 * slot with the same media: the group canvas is the bounding box of the
+	 * member rectangles and each member shows its slice (multi-monitor
+	 * wallpaper strategy), so the image reads as ONE continuous picture. */
+	private async applyArea(surface: SurfaceId): Promise<void> {
+		const target = this.currentImage(surface);
+		if (this.sameMedia(this.lastPainted[surface], target)) {
+			this.lastPainted[surface] = target !== undefined ? { ...target } : null;
+			// Same media = no crossfade — but the markers still need
+			// refreshing: a host blip (settings dialog closed, better-sidebar
+			// panel restructure) or an availability-triggered repaint may have
+			// flipped a member marker off, and nothing else re-enables the
+			// shell transparency CSS (a missing marker = opaque content over
+			// the layers, e.g. the composer's black fade band).
+			this.markSurfaceOn(surface, target !== undefined);
+			if (this.fadeTimers[surface] !== undefined) {
 				// A crossfade to this very media is in flight. If the layer
-				// pair survived, the fade already delivers it — repainting the
-				// outgoing layer here would clobber the fade with an instant
+				// pairs survived, the fade already delivers it — repainting the
+				// outgoing layers here would clobber the fade with an instant
 				// full-opacity paint. If the layers were re-created meanwhile
 				// (session/view switch destroyed the host), the fade cannot
 				// settle on the new elements: cancel it and restore directly.
-				if (this.layerPairHealthy(area)) return;
-				clearTimeout(this.fadeTimers[area]);
-				this.fadeTimers[area] = undefined;
+				if (this.layerPairsHealthy(surface)) return;
+				clearTimeout(this.fadeTimers[surface]);
+				this.fadeTimers[surface] = undefined;
 			}
-			this.refreshActiveLayer(area);
+			this.refreshActiveLayer(surface);
 			return;
 		}
 		// URL media resolve synchronously (gate + paint land immediately);
@@ -591,55 +1041,199 @@ export class BackgroundService {
 		const url = target !== undefined && target.source === "url"
 			? target.url
 			: (target !== undefined ? await this.displayUrlOf(target) : "");
-		if (this.currentImage(area) !== target) return; // target changed meanwhile
-		this.lastPainted[area] = target !== undefined ? { ...target } : null;
-		const root = document.documentElement;
-		root.setAttribute(`data-dsh-bg-${area}`, url !== "" ? "on" : "off");
-		const prev = this.activeLayer[area];
+		if (this.currentImage(surface) !== target) return; // target changed meanwhile
+		this.lastPainted[surface] = target !== undefined ? { ...target } : null;
+		// A member of a merged group does NOT own its marker: the group's
+		// markSurfaceOn paints every member slot. Flipping the member off
+		// here (its own config is disabled while merged) would fight the
+		// group's ON marker and leave the member's shell opaque.
+		if (!this.isGroupMember(surface)) this.markSurfaceOn(surface, url !== "");
+		const prev = this.activeLayer[surface];
 		const next: LayerIndex = prev === 0 ? 1 : 0;
-		if (!this.paintedOnce[area]) {
+		if (!this.paintedOnce[surface]) {
 			// First paint: show directly, no animation.
-			this.paintLayer(area, next, url, target, 1);
-			this.setLayerFade(area, prev, 0);
-			this.activeLayer[area] = next;
-			this.paintedOnce[area] = true;
+			this.paintSlots(surface, next, url, target, 1);
+			this.fadeSlots(surface, prev, 0);
+			this.activeLayer[surface] = next;
+			this.paintedOnce[surface] = true;
 			return;
 		}
-		// Crossfade: stage the incoming layer's media at fade 0, then fade it
-		// in while the outgoing layer fades out (keeping its media until
-		// settled). The fade is driven by the Web Animations API rather than
-		// a CSS transition: it starts deterministically (no forced-reflow
-		// dance), survives shell stylesheet overrides and reduced-motion
-		// resets, and retargets cleanly when a newer switch lands mid-fade.
-		const incomingFrom = this.currentLayerOpacity(area, next); // read before staging (retarget continuity)
-		this.paintLayer(area, next, url, target, 0);
-		this.fadeLayer(area, next, target !== undefined ? clamp(target.opacity, 0, 1) : 0, incomingFrom);
-		this.fadeLayer(area, prev, 0);
-		if (this.fadeTimers[area] !== undefined) clearTimeout(this.fadeTimers[area]);
-		this.fadeTimers[area] = setTimeout(() => {
-			this.fadeTimers[area] = undefined;
-			if (!this.layerPairHealthy(area)) {
-				// The layer pair was re-created while the fade ran: the fade
-				// cannot settle on the new elements. Repaint the active layer
+		// Crossfade: stage the incoming layers' media at fade 0, then fade
+		// them in while the outgoing layers fade out (keeping their media
+		// until settled). The fade is driven by the Web Animations API.
+		const incomingFrom = this.currentLayerOpacity(surface, this.surfaceSlots(surface)[0]?.slot ?? "", next); // read before staging (retarget continuity)
+		this.paintSlots(surface, next, url, target, 0);
+		this.fadeSlots(surface, next, target !== undefined ? clamp(target.opacity, 0, 1) : 0, incomingFrom);
+		this.fadeSlots(surface, prev, 0);
+		if (this.fadeTimers[surface] !== undefined) clearTimeout(this.fadeTimers[surface]);
+		this.fadeTimers[surface] = setTimeout(() => {
+			this.fadeTimers[surface] = undefined;
+			if (!this.layerPairsHealthy(surface)) {
+				// The layer pairs were re-created while the fade ran: the fade
+				// cannot settle on the new elements. Repaint the active layers
 				// directly (the playback index already advanced, so the
 				// current image is exactly the fade target).
-				this.refreshActiveLayer(area);
+				this.refreshActiveLayer(surface);
 				return;
 			}
-			this.activeLayer[area] = next;
-			this.cleanupLayer(area, prev);
-			this.ensureActiveFade(area);
+			this.activeLayer[surface] = next;
+			this.cleanupSlots(surface, prev);
+			this.ensureActiveFade(surface);
+			// A layout change (tab switch, resize) mid-fade left the slices
+			// stale while applyArea had to stand down — refresh them now.
+			if (surface.startsWith("group:") && this.groupGeometryStale(surface)) {
+				this.refreshActiveLayer(surface);
+			}
 		}, FADE_SETTLE_MS);
 	}
 
-	/** True when both layer elements exist and have been projected at least
-	 * once. A fresh element (re-created after its host was destroyed) has
-	 * not been painted or explicitly hidden yet, so it must be initialized
-	 * before the pair can be trusted. */
-	private layerPairHealthy(area: AreaId): boolean {
-		for (const which of [0, 1] as const) {
-			const el = document.getElementById(this.layerId(area, which));
-			if (el === null || !this.projectedLayers.has(el)) return false;
+	/** A slot whose host disappeared (closed tab, closed settings dialog):
+	 * flip its markers off so the transparency/lift CSS never leaks onto
+	 * unrelated elements. Tab markers died with their host element; built-in
+	 * member markers live on <html> and must be cleared explicitly. */
+	private markSlotGone(surface: SurfaceId, slot: string): void {
+		if (surface.startsWith("group:")) {
+			if (slot !== "" && !slot.startsWith("tab-")) {
+				document.documentElement.setAttribute(`data-dsh-bg-${slot}`, "off");
+			}
+			return;
+		}
+		this.markSurfaceOn(surface, false);
+	}
+
+	/** True when a merged group's painted slices no longer match the current
+	 * member rects (tabs switched, panels resized, window resized). */
+	private groupGeometryStale(surface: SurfaceId): boolean {
+		const last = this.lastGeometry.get(surface);
+		const now = this.groupGeometryOf(surface);
+		if (now === null) return last !== undefined && last !== null;
+		if (last === undefined || last === null) return true;
+		if (now.size !== last.size) return true;
+		for (const [slot, g] of now) {
+			const l = last.get(slot);
+			if (l === undefined) return true;
+			if (Math.abs(l.w - g.w) > 1 || Math.abs(l.h - g.h) > 1 || Math.abs(l.dx - g.dx) > 1 || Math.abs(l.dy - g.dy) > 1) return true;
+		}
+		return false;
+	}
+
+	/** True when the surface currently belongs to a merged group. */
+	private isGroupMember(surface: SurfaceId): boolean {
+		return this.state.groups.some((g) => g.members.includes(surface));
+	}
+
+	/** Set the on/off markers of a surface's members (built-in members use
+	 * the html data attribute their transparency CSS keys on; tab members
+	 * use the per-host data-dshbg-tab-on marker). A surface whose host is
+	 * GONE (closed tab, closed settings dialog) is marked OFF — stale marks
+	 * would otherwise leak our transparency/lift CSS onto unrelated
+	 * dialogs/surfaces and confuse the page's stacking. */
+	private markSurfaceOn(surface: SurfaceId, on: boolean): void {
+		const token = surfaceToken(surface);
+		const slots = this.surfaceSlots(surface);
+		if (!surface.startsWith("group:")) {
+			const host = slots[0]?.host ?? null;
+			const effective = on && host !== null;
+			document.documentElement.setAttribute(`data-dsh-bg-${token}`, effective ? "on" : "off");
+			if (isTabSurface(surface)) {
+				if (host instanceof HTMLElement) {
+					if (effective) host.setAttribute("data-dshbg-tab-on", "true");
+					else host.removeAttribute("data-dshbg-tab-on");
+				}
+			}
+			return;
+		}
+		document.documentElement.setAttribute(`data-dsh-bg-${token}`, on ? "on" : "off");
+		for (const slot of slots) {
+			if (slot.host === null) {
+				// Closed dialog/tab member: clear the built-in member marker
+				// (tab markers died with their host element).
+				if (slot.slot !== "" && !slot.slot.startsWith("tab-")) {
+					document.documentElement.setAttribute(`data-dsh-bg-${slot.slot}`, "off");
+				}
+				continue;
+			}
+			if (slot.slot.startsWith("tab-") && slot.host instanceof HTMLElement) {
+				if (on) slot.host.setAttribute("data-dshbg-tab-on", "true");
+				else slot.host.removeAttribute("data-dshbg-tab-on");
+			} else {
+				// built-in member: its own transparency CSS keys on the
+				// member's data attribute
+				document.documentElement.setAttribute(`data-dsh-bg-${slot.slot}`, on ? "on" : "off");
+			}
+		}
+	}
+
+	/** The merged canvas geometry: bounding box of the member rectangles,
+	 * and per member the slice offsets (negative, so the shared image lines
+	 * up across members). Null for non-group surfaces. */
+	private groupGeometryOf(surface: SurfaceId): Map<string, { w: number; h: number; dx: number; dy: number }> | null {
+		if (!surface.startsWith("group:")) return null;
+		// The better-sidebar bottom panel overlays the bottom of the center
+		// column: members it covers must not contribute their hidden strip to
+		// the canvas, or the picture reads as misaligned between surfaces.
+		let bottomTop: number | null = null;
+		const bottomPanel = this.betterPanelHost("bottom");
+		if (bottomPanel !== null) {
+			const r = bottomPanel.getBoundingClientRect();
+			if (r.width > 0 && r.height > 0) bottomTop = r.top;
+		}
+		const entries: Array<{ slot: string; rect: DOMRect }> = [];
+		for (const slot of this.surfaceSlots(surface)) {
+			if (slot.host === null) continue;
+			const rect = slot.host.getBoundingClientRect();
+			// Hidden members (display:none tabs) report an all-zero rect —
+			// including them would pollute the canvas bounding box.
+			if (rect.width === 0 && rect.height === 0) continue;
+			if (bottomTop !== null && rect.top < bottomTop && rect.bottom > bottomTop && rect.left < (bottomPanel?.getBoundingClientRect().right ?? 0) && rect.right > (bottomPanel?.getBoundingClientRect().left ?? 0)) {
+				// NOTE: DOMRect properties live on the prototype — spreading
+				// `{ ...rect }` would produce an empty object. Build the
+				// clipped rect field by field.
+				entries.push({
+					slot: slot.slot,
+					rect: {
+						left: rect.left,
+						top: rect.top,
+						right: rect.right,
+						bottom: bottomTop,
+						width: rect.width,
+						height: Math.max(0, bottomTop - rect.top),
+						x: rect.left,
+						y: rect.top,
+						toJSON: () => ({})
+					} as DOMRect
+				});
+			} else {
+				entries.push({ slot: slot.slot, rect });
+			}
+		}
+		if (entries.length === 0) return null;
+		let minX = Infinity;
+		let minY = Infinity;
+		let maxX = -Infinity;
+		let maxY = -Infinity;
+		for (const { rect } of entries) {
+			minX = Math.min(minX, rect.left);
+			minY = Math.min(minY, rect.top);
+			maxX = Math.max(maxX, rect.right);
+			maxY = Math.max(maxY, rect.bottom);
+		}
+		if (!Number.isFinite(minX)) return null;
+		const out = new Map<string, { w: number; h: number; dx: number; dy: number }>();
+		for (const { slot, rect } of entries) {
+			out.set(slot, { w: maxX - minX, h: maxY - minY, dx: -(rect.left - minX), dy: -(rect.top - minY) });
+		}
+		return out;
+	}
+
+	/** True when every layer pair of the surface exists and has been
+	 * projected at least once. */
+	private layerPairsHealthy(surface: SurfaceId): boolean {
+		for (const slot of this.surfaceSlots(surface)) {
+			for (const which of [0, 1] as const) {
+				const el = document.getElementById(this.layerId(surface, slot.slot, which));
+				if (el === null || !this.projectedLayers.has(el)) return false;
+			}
 		}
 		return true;
 	}
@@ -652,11 +1246,11 @@ export class BackgroundService {
 	}
 
 	/** Cancel a layer's running fade animation (if any). */
-	private cancelLayerFade(area: AreaId, which: LayerIndex): void {
-		const anim = this.layerAnims[area][which];
-		if (anim !== null) {
+	private cancelLayerFade(layerId: string): void {
+		const anim = this.layerAnims.get(layerId) ?? null;
+		if (anim != null) {
 			anim.cancel();
-			this.layerAnims[area][which] = null;
+			this.layerAnims.set(layerId, null);
 		}
 	}
 
@@ -678,11 +1272,28 @@ export class BackgroundService {
 
 	/** A layer's current VISUAL opacity: computed style reflects a running
 	 * animation's interpolated value (inline style does not). */
-	private currentLayerOpacity(area: AreaId, which: LayerIndex): number {
-		const el = document.getElementById(this.layerId(area, which));
+	private currentLayerOpacity(surface: SurfaceId, slot: string, which: LayerIndex): number {
+		const el = document.getElementById(this.layerId(surface, slot, which));
 		if (el === null) return 0;
 		const raw = Number(getComputedStyle(el).opacity);
 		return Number.isFinite(raw) ? clamp(raw, 0, 1) : 0;
+	}
+
+	/** Paint every slot at once (same media, per-slot canvas slice). */
+	private paintSlots(surface: SurfaceId, which: LayerIndex, url: string, img: ImageConfig | undefined, fade: number): void {
+		const geometry = this.groupGeometryOf(surface);
+		// Cache BOTH states: "no members visible" is a stable geometry too.
+		this.lastGeometry.set(surface, geometry !== null ? new Map(geometry) : null);
+		for (const slot of this.surfaceSlots(surface)) {
+			this.paintLayer(surface, slot.slot, which, url, img, fade, geometry?.get(slot.slot));
+		}
+	}
+
+	/** Fade every slot's layer at once. */
+	private fadeSlots(surface: SurfaceId, which: LayerIndex, to: number, from?: number): void {
+		for (const slot of this.surfaceSlots(surface)) {
+			this.fadeLayer(surface, slot.slot, which, to, from);
+		}
 	}
 
 	/** Drive one layer's opacity to `to` with a WAAPI animation. The start
@@ -690,12 +1301,13 @@ export class BackgroundService {
 	 * pinned by the caller before re-staging) so a retarget mid-fade
 	 * continues exactly where the previous animation left off; on finish
 	 * the inline opacity is pinned to the target and the animation dropped. */
-	private fadeLayer(area: AreaId, which: LayerIndex, to: number, from?: number): void {
-		const el = document.getElementById(this.layerId(area, which));
+	private fadeLayer(surface: SurfaceId, slot: string, which: LayerIndex, to: number, from?: number): void {
+		const id = this.layerId(surface, slot, which);
+		const el = document.getElementById(id);
 		if (el === null) return;
 		this.projectedLayers.add(el);
 		const raw = from !== undefined ? from : Number(getComputedStyle(el).opacity);
-		this.cancelLayerFade(area, which);
+		this.cancelLayerFade(id);
 		const target = clamp(to, 0, 1);
 		const start = Number.isFinite(raw) ? clamp(raw, 0, 1) : 0;
 		if (start === target || typeof el.animate !== "function") {
@@ -709,42 +1321,45 @@ export class BackgroundService {
 			[{ opacity: String(start) }, { opacity: String(target) }],
 			{ duration: FADE_MS, easing: "ease", fill: "forwards" }
 		);
-		this.layerAnims[area][which] = anim;
+		this.layerAnims.set(id, anim);
 		anim.onfinish = () => {
 			el.style.opacity = String(target);
 			anim.cancel(); // drop the forwards fill — inline now holds the value
-			if (this.layerAnims[area][which] === anim) this.layerAnims[area][which] = null;
+			if (this.layerAnims.get(id) === anim) this.layerAnims.set(id, null);
 			this.syncVideoPlayState(el, target > 0);
 		};
 		// Visible layers play immediately (hidden ones pause at the finish).
 		this.syncVideoPlayState(el, target > 0);
 	}
 
-	/** Refresh the currently visible layer's media/render in place (same
-	 * media — opacity/blur tweaks, no animation) and keep the OTHER layer
-	 * hidden: after a session/view switch re-creates the layer pair, the
-	 * fresh sibling must be pinned to fade 0 or it covers the active layer. */
-	private refreshActiveLayer(area: AreaId): void {
-		const active = this.activeLayer[area];
-		const img = this.currentImage(area);
+	/** Refresh the currently visible layers' media/render in place (same
+	 * media — opacity/blur tweaks or moved members, no animation) and keep
+	 * the OTHER layers hidden: after a session/view switch re-creates the
+	 * layer pairs, the fresh siblings must be pinned to fade 0 or they cover
+	 * the active layers. */
+	private refreshActiveLayer(surface: SurfaceId): void {
+		const active = this.activeLayer[surface];
+		const img = this.currentImage(surface);
 		const mediaKey = this.mediaKeyOf(img);
-		this.setLayerFade(area, active === 0 ? 1 : 0, 0);
+		this.fadeSlots(surface, active === 0 ? 1 : 0, 0);
 		void this.displayUrlOf(img ?? ({ source: "url", url: "", media: "image" } as ImageConfig)).then((url) => {
-			const current = this.currentImage(area);
-			// A crossfade started meanwhile (it owns the layer pair), or the
+			const current = this.currentImage(surface);
+			// A crossfade started meanwhile (it owns the layer pairs), or the
 			// media changed (a newer applyArea owns the paint) — stand down.
-			if (this.fadeTimers[area] !== undefined || this.mediaKeyOf(current) !== mediaKey) return;
-			this.paintLayer(area, active, url, current, 1);
+			if (this.fadeTimers[surface] !== undefined || this.mediaKeyOf(current) !== mediaKey) return;
+			this.paintSlots(surface, active, url, current, 1);
 		});
 	}
 
 	/** Paint one layer: render vars + fade, and the media child (an image
-	 * div or a muted looping video). Videos pause at fade 0. */
-	private paintLayer(area: AreaId, which: LayerIndex, url: string, img: ImageConfig | undefined, fade: number): void {
-		const el = document.getElementById(this.layerId(area, which));
+	 * div or a muted looping video). Videos pause at fade 0. `slice` carries
+	 * the merged-canvas geometry for group members (explicit px canvas size
+	 * + negative offsets so the shared image lines up across members). */
+	private paintLayer(surface: SurfaceId, slot: string, which: LayerIndex, url: string, img: ImageConfig | undefined, fade: number, slice?: { w: number; h: number; dx: number; dy: number }): void {
+		const el = document.getElementById(this.layerId(surface, slot, which));
 		if (el === null) return;
 		this.projectedLayers.add(el);
-		this.cancelLayerFade(area, which); // direct write supersedes any running fade
+		this.cancelLayerFade(this.layerId(surface, slot, which)); // direct write supersedes any running fade
 		const opacity = img !== undefined ? clamp(img.opacity, 0, 1) : 0;
 		const display = img !== undefined ? resolveDisplay(img) : { size: "cover", position: "center", repeat: "no-repeat", rotate: "0deg", radius: "0px" };
 		el.style.opacity = String(clamp(fade, 0, 1) * opacity);
@@ -784,9 +1399,39 @@ export class BackgroundService {
 			return;
 		}
 
+		if (slice !== undefined) {
+			// Merged canvas slice: explicit canvas size + negative offsets.
+			if (media.tagName === "VIDEO") {
+				const video = media as HTMLVideoElement;
+				if (video.getAttribute("src") !== url) video.src = url;
+				video.style.width = `${slice.w}px`;
+				video.style.height = `${slice.h}px`;
+				video.style.left = `${slice.dx}px`;
+				video.style.top = `${slice.dy}px`;
+				video.style.objectFit = "fill";
+				video.style.objectPosition = "0% 0%";
+				if (fade > 0) {
+					void video.play().catch(() => {});
+				} else {
+					video.pause();
+				}
+			} else {
+				const div = media as HTMLElement;
+				div.style.backgroundImage = `url("${escapeCssString(url)}")`;
+				div.style.backgroundSize = `${slice.w}px ${slice.h}px`;
+				div.style.backgroundPosition = `${slice.dx}px ${slice.dy}px`;
+				div.style.backgroundRepeat = "no-repeat";
+			}
+			return;
+		}
+
 		if (media.tagName === "VIDEO") {
 			const video = media as HTMLVideoElement;
 			if (video.getAttribute("src") !== url) video.src = url;
+			video.style.width = "";
+			video.style.height = "";
+			video.style.left = "";
+			video.style.top = "";
 			video.style.objectFit = videoFitOf(img.mode);
 			video.style.objectPosition = `${img.posX} ${img.posY}`;
 			if (fade > 0) {
@@ -806,41 +1451,43 @@ export class BackgroundService {
 		}
 	}
 
-	private setLayerFade(area: AreaId, which: LayerIndex, fade: number): void {
-		const el = document.getElementById(this.layerId(area, which));
+	private setLayerFade(surface: SurfaceId, slot: string, which: LayerIndex, fade: number): void {
+		const el = document.getElementById(this.layerId(surface, slot, which));
 		if (el === null) return;
 		this.projectedLayers.add(el);
-		this.cancelLayerFade(area, which); // direct write supersedes any running fade
-		const img = this.currentImage(area);
+		this.cancelLayerFade(this.layerId(surface, slot, which)); // direct write supersedes any running fade
+		const img = this.currentImage(surface);
 		const opacity = img !== undefined ? clamp(img.opacity, 0, 1) : 0;
 		el.style.opacity = String(clamp(fade, 0, 1) * opacity);
 		// Keep the video playing state in step with its fade.
 		this.syncVideoPlayState(el, fade > 0);
 	}
 
-	/** Drop a layer's media (after its fade-out completed). */
-	private cleanupLayer(area: AreaId, which: LayerIndex): void {
-		const el = document.getElementById(this.layerId(area, which));
-		if (el === null) return;
-		this.cancelLayerFade(area, which);
-		el.style.opacity = "0";
-		const media = el.firstElementChild;
-		if (media !== null) {
-			if (media.tagName === "VIDEO") {
-				const video = media as HTMLVideoElement;
-				video.pause();
-				video.removeAttribute("src");
-			} else {
-				(media as HTMLElement).style.backgroundImage = "none";
+	/** Drop every slot's layer of one side (after its fade-out completed). */
+	private cleanupSlots(surface: SurfaceId, which: LayerIndex): void {
+		for (const slot of this.surfaceSlots(surface)) {
+			const el = document.getElementById(this.layerId(surface, slot.slot, which));
+			if (el === null) continue;
+			this.cancelLayerFade(this.layerId(surface, slot.slot, which));
+			el.style.opacity = "0";
+			const media = el.firstElementChild;
+			if (media !== null) {
+				if (media.tagName === "VIDEO") {
+					const video = media as HTMLVideoElement;
+					video.pause();
+					video.removeAttribute("src");
+				} else {
+					(media as HTMLElement).style.backgroundImage = "none";
+				}
 			}
 		}
 	}
 
-	/** Ensure the active layer is fully visible and the other is hidden. */
-	private ensureActiveFade(area: AreaId): void {
-		const active = this.activeLayer[area];
-		this.setLayerFade(area, active, 1);
-		this.setLayerFade(area, active === 0 ? 1 : 0, 0);
+	/** Ensure the active layers are fully visible and the others hidden. */
+	private ensureActiveFade(surface: SurfaceId): void {
+		const active = this.activeLayer[surface];
+		this.fadeSlots(surface, active, 1);
+		this.fadeSlots(surface, active === 0 ? 1 : 0, 0);
 	}
 
 	//#endregion

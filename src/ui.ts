@@ -7,28 +7,81 @@
 import { jsx, jsxs, Fragment } from "react/jsx-runtime";
 import { useEffect, useState } from "react";
 import { Button, IconChevronDownOutline14, Input } from "@deepseek-ai/dsh-client-ui-primitives";
-import { AREAS, MODES, REPEATS, parseImageList, imageOfUrl } from "./constants";
+import { MODES, REPEATS, parseImageList, imageOfUrl } from "./constants";
 import { importPickedFiles, pickFiles } from "./files";
 import type { AddImagesResult } from "./service";
 import type { PickerAccept } from "./files";
-import type { AreaId, ImageConfig } from "./types";
+import type { ImageConfig, SurfaceGroup, SurfaceId } from "./types";
 import type { BackgroundRowState } from "./store";
+
+/** Replace {placeholders} in a locale template. */
+function fmt(template: string, vars: Record<string, string | number>): string {
+	return template.replace(/\{(\w+)\}/g, (_, key: string) => String(vars[key] ?? ""));
+}
+
+/** Drag payload travelling inside HTML5 drag & drop. The payload lives in
+ * `dataTransfer` (the only place readable at drop time in every browser) —
+ * React state is only a visual fallback, never the source of truth. */
+interface DragPayload {
+	kind: "surface" | "member";
+	/** Surface being dragged (kind "surface"), or the member (kind "member"). */
+	id: SurfaceId;
+	/** Group the member belongs to (kind "member" only). */
+	groupId?: SurfaceId;
+}
+
+/** Custom MIME marking a background-surface drag (readable via `types` even
+ * in `dragover`, where `getData` is blocked in protected mode). */
+const DSHBG_MIME = "application/x-dshbg";
+
+/** True when the drag carries a background-surface payload. Safe to call in
+ * `dragover`/`dragenter` (types are readable; getData is not). */
+export function hasDshbgPayload(event: DragEvent): boolean {
+	const types = event.dataTransfer?.types;
+	if (types === undefined || types === null) return false;
+	return Array.from(types).includes(DSHBG_MIME);
+}
+
+/** Parse the drag payload from `dataTransfer` (works in `drop` everywhere). */
+export function readDragPayload(event: DragEvent): DragPayload | null {
+	try {
+		const raw = event.dataTransfer?.getData(DSHBG_MIME);
+		if (raw === undefined || raw === "") return null;
+		const parsed: unknown = JSON.parse(raw);
+		if (parsed === null || typeof parsed !== "object") return null;
+		const record = parsed as Record<string, unknown>;
+		if ((record.kind !== "surface" && record.kind !== "member") || typeof record.id !== "string") return null;
+		return { kind: record.kind, id: record.id, groupId: typeof record.groupId === "string" ? record.groupId : undefined } as DragPayload;
+	} catch {
+		return null;
+	}
+}
 
 /** Composed slot props handed to the section component. */
 export interface BackgroundSectionProps {
 	t: (key: string) => string;
 	useStore: <T>(selector: (state: BackgroundRowState) => T) => T;
-	/** Add images/videos to an area. Groups are single-kind: a mixed batch
+	/** Add images/videos to a surface. Groups are single-kind: a mixed batch
 	 * is filtered and the skipped part reported via the result. */
-	addImages: (area: AreaId, images: ImageConfig[]) => AddImagesResult;
-	removeImage: (area: AreaId, index: number) => void;
-	updateImage: (area: AreaId, index: number, patch: Partial<ImageConfig>) => void;
-	setEnabled: (area: AreaId, enabled: boolean) => void;
-	setIntervalSec: (area: AreaId, seconds: number) => void;
-	setRandom: (area: AreaId, random: boolean) => void;
-	next: (area: AreaId) => void;
+	addImages: (surface: SurfaceId, images: ImageConfig[]) => AddImagesResult;
+	removeImage: (surface: SurfaceId, index: number) => void;
+	updateImage: (surface: SurfaceId, index: number, patch: Partial<ImageConfig>) => void;
+	setEnabled: (surface: SurfaceId, enabled: boolean) => void;
+	setIntervalSec: (surface: SurfaceId, seconds: number) => void;
+	setRandom: (surface: SurfaceId, random: boolean) => void;
+	next: (surface: SurfaceId) => void;
 	/** Show a specific image (selecting a strip thumbnail previews it). */
-	showImage: (area: AreaId, index: number) => void;
+	showImage: (surface: SurfaceId, index: number) => void;
+	/** Merge several standalone surfaces into one continuous-canvas group. */
+	mergeSurfaces: (members: SurfaceId[]) => SurfaceId | null;
+	/** Dissolve a merged group (its media lands on every member). */
+	unmerge: (groupId: SurfaceId) => void;
+	/** Add a standalone surface into an existing group (drag onto a group row). */
+	addMemberToGroup: (groupId: SurfaceId, member: SurfaceId) => void;
+	/** Pull a member out of its group (chip × or drag-out). */
+	removeMemberFromGroup: (groupId: SurfaceId, member: SurfaceId) => void;
+	/** Clear a surface's media entirely. */
+	clearSurface: (surface: SurfaceId) => void;
 	/** Resolve a display URL for an image (local files via IndexedDB). */
 	resolvePreview: (img: ImageConfig) => Promise<string>;
 }
@@ -268,29 +321,61 @@ function EditorPanel(props: {
 	});
 }
 
-/** The Background settings section. */
+/**
+ * The Background settings UI: a unified surface list replaces the old
+ * "one area at a time" segmented control plus the overlapping "apply to"
+ * chips. Every surface (the four built-in areas and every open
+ * dsh-better-sidebar tab) is a row:
+ * - the CHECKBOX marks add targets (a batch lands on every checked row);
+ * - clicking the row FOCUSES it (the detail editor below edits that
+ * surface); with nothing checked, adds fall back to the focused row.
+ * Panel tabs are grouped under their panel and discovered live.
+ */
 export function BackgroundSection(props: BackgroundSectionProps) {
-	const { t, useStore, addImages, removeImage, updateImage, setEnabled, setIntervalSec, setRandom, next, showImage, resolvePreview } = props;
+	const { t, useStore, addImages, removeImage, updateImage, setEnabled, setIntervalSec, setRandom, next, showImage, resolvePreview, mergeSurfaces, unmerge, addMemberToGroup, removeMemberFromGroup, clearSurface } = props;
 	const s = useStore((state) => state);
-	const [area, setArea] = useState<AreaId>("conversation");
+	const [focus, setFocus] = useState<SurfaceId>("conversation");
+	const [checked, setChecked] = useState<SurfaceId[]>([]);
 	const [urlDraft, setUrlDraft] = useState("");
 	const [selected, setSelected] = useState<number | null>(null);
 	const [busy, setBusy] = useState(false);
 	const [readError, setReadError] = useState(false);
 	const [mixError, setMixError] = useState<AddImagesResult | null>(null);
-	const cfg = s.areas[area];
+	/** Drag payload (visual fallback only — the drop path reads dataTransfer). */
+	const [drag, setDrag] = useState<DragPayload | null>(null);
+	/** Row currently hovered as a drop target. */
+	const [dropTarget, setDropTarget] = useState<string | null>(null);
+
+	/** Surfaces in display order. */
+	const surfaces = Object.keys(s.areas).filter((id) => s.meta[id] !== undefined);
+	const availableSurfaces = surfaces.filter((id) => s.meta[id].available);
+	/** The surface being edited (falls back when the focused one vanished). */
+	const focusSurface: SurfaceId = availableSurfaces.includes(focus) ? focus : (availableSurfaces[0] ?? "conversation");
+	const cfg = s.areas[focusSurface] ?? { enabled: false, images: [] as ImageConfig[], intervalSec: 15, random: false, index: 0 };
 	const selectedImg = selected !== null ? cfg.images[selected] : undefined;
+	/** Add targets: checked rows win; with none checked, the focused row. */
+	const targets: SurfaceId[] = checked.filter((id) => availableSurfaces.includes(id));
+	const effectiveTargets = targets.length > 0 ? targets : [focusSurface];
 
 	useEffect(() => {
 		setSelected(null);
 		setMixError(null);
-	}, [area]);
+	}, [focusSurface]);
 
-	/** Add a batch and surface the single-kind group rule (mixed additions
-	 * are skipped and reported inline). */
+	/** Add a batch to every target surface (independent copies). */
 	const applyAdd = (configs: ImageConfig[]) => {
-		const result = addImages(area, configs);
-		setMixError(result.skipped > 0 ? result : null);
+		let skipped = 0;
+		let skippedKind: AddImagesResult["skippedKind"];
+		for (const target of effectiveTargets) {
+			const result = addImages(target, configs.map((img) => ({ ...img })));
+			skipped += result.skipped;
+			if (result.skippedKind !== undefined) skippedKind = result.skippedKind;
+		}
+		setMixError(skipped > 0 ? { added: configs.length * effectiveTargets.length - skipped, skipped, skippedKind } : null);
+	};
+
+	const toggleChecked = (id: SurfaceId) => {
+		setChecked((current) => (current.includes(id) ? current.filter((c) => c !== id) : [...current, id]));
 	};
 
 	const handleFiles = async (files: FileList, accept: PickerAccept, directory: boolean) => {
@@ -309,8 +394,92 @@ export function BackgroundSection(props: BackgroundSectionProps) {
 	};
 
 	const onRemove = (index: number) => {
-		removeImage(area, index);
+		removeImage(focusSurface, index);
 		setSelected((current) => (current === null ? null : current >= cfg.images.length - 1 ? Math.max(0, cfg.images.length - 2) : current));
+	};
+
+	const surfaceLabel = (id: SurfaceId): string => {
+		const meta = s.meta[id];
+		if (meta === undefined) return id;
+		if (meta.group === "group") return `${t("group.name")}${meta.members !== undefined && meta.members.length > 0 ? `（${meta.members.length}）` : ""}`;
+		return meta.group === "builtin" ? t(`area.${id}`) : meta.label;
+	};
+
+	const memberLabel = (id: SurfaceId): string => {
+		const meta = s.meta[id];
+		if (meta === undefined) return id;
+		return meta.group === "builtin" ? t(`area.${id}`) : meta.label;
+	};
+
+	const groupOf = (id: SurfaceId): SurfaceGroup => s.meta[id]?.group ?? "builtin";
+	const groups: SurfaceGroup[] = ["group", "builtin", "panel-right", "panel-bottom"];
+	const rowsByGroup = (group: SurfaceGroup): SurfaceId[] => surfaces.filter((id) => groupOf(id) === group);
+
+	/** Drop handling: a surface onto a row merges (or joins a group); a
+	 * member dropped anywhere detaches from its group. The payload comes from
+	 * `dataTransfer` — never from React state (whose closure can be stale). */
+	const handleDropOn = (targetId: SurfaceId, payload: DragPayload | null): void => {
+		setDropTarget(null);
+		const effective = payload ?? drag;
+		setDrag(null);
+		if (effective === null) {
+			console.log("[dsh-bg] drop on row without payload — ignored", targetId);
+			return;
+		}
+		console.log("[dsh-bg] drop on row", targetId, effective);
+		if (effective.kind === "member") {
+			// Dropping a member onto ANOTHER group's row (or member row) moves
+			// it there; onto its own group (or a non-group row) detaches it.
+			const targetMeta = s.meta[targetId];
+			const targetGroup = targetMeta?.group === "group" ? targetId : targetMeta?.memberOf;
+			if (targetGroup !== undefined && targetGroup !== effective.groupId) {
+				removeMemberFromGroup(effective.groupId ?? "", effective.id);
+				addMemberToGroup(targetGroup, effective.id);
+			} else {
+				removeMemberFromGroup(effective.groupId ?? "", effective.id);
+			}
+			return;
+		}
+		if (effective.id === targetId) return;
+		const targetMeta = s.meta[targetId];
+		// A member row represents its group: dropping onto it joins that group
+		// (dropping onto the group row itself does the same).
+		const groupIdOf = targetMeta?.group === "group" ? targetId : targetMeta?.memberOf;
+		if (groupIdOf !== undefined) {
+			addMemberToGroup(groupIdOf, effective.id);
+			return;
+		}
+		const result = mergeSurfaces([effective.id, targetId]);
+		if (result !== null) {
+			setChecked([]);
+			setFocus(result);
+		}
+	};
+
+	const handleDropOutside = (payload: DragPayload | null): void => {
+		const effective = payload ?? drag;
+		setDrag(null);
+		if (effective === null) {
+			setDropTarget(null);
+			return;
+		}
+		console.log("[dsh-bg] drop outside rows", effective, "last row:", dropTarget);
+		if (effective.kind === "member") {
+			setDropTarget(null);
+			removeMemberFromGroup(effective.groupId ?? "", effective.id);
+			return;
+		}
+		// A surface released on a gap/header while a row was highlighted:
+		// honor the highlighted row (the mouse only missed it by a pixel).
+		if (dropTarget !== null) {
+			handleDropOn(dropTarget, effective);
+			return;
+		}
+		setDropTarget(null);
+	};
+
+	const clearChecked = () => {
+		for (const target of effectiveTargets) clearSurface(target);
 	};
 
 	return jsxs("div", {
@@ -323,22 +492,7 @@ export function BackgroundSection(props: BackgroundSectionProps) {
 					jsx("div", { className: "dshbg-sub", children: t("subtitle") })
 				]
 			}),
-			jsx("div", {
-				className: "dshbg-seg",
-				children: AREAS.map((id) => {
-					const active = s.areas[id].enabled && s.areas[id].images.length > 0;
-					return jsx("button", {
-						type: "button",
-						className: `dshbg-segBtn${area === id ? " dshbg-selected" : ""}`,
-						"aria-pressed": area === id,
-						onClick: () => setArea(id),
-						children: [
-							jsx("span", { className: "dshbg-dot", "data-active": active }),
-							t(`area.${id}`)
-						]
-					}, id);
-				})
-			}),
+			/* ---- action bar (checkboxes select, buttons act) ---- */
 			jsxs("div", {
 				className: "dshbg-addRow",
 				children: [
@@ -385,9 +539,161 @@ export function BackgroundSection(props: BackgroundSectionProps) {
 						children: t("add.folder")
 					}),
 					jsx(Button, {
+						variant: "ghost",
+						size: "sm",
+						onClick: () => setChecked(checked.length === availableSurfaces.length ? [] : [...availableSurfaces]),
+						children: checked.length === availableSurfaces.length ? t("apply.none") : t("apply.all")
+					}),
+					jsx(Button, {
+						variant: "ghost",
+						size: "sm",
+						title: t("surface.clear"),
+						onClick: clearChecked,
+						children: t("surface.clear")
+					})
+				]
+			}),
+			/* ---- surface list ---- */
+			jsx("div", {
+				className: `dshbg-surfaces${drag?.kind === "member" ? " dshbg-dragOut" : ""}`,
+				onDragOver: (event: DragEvent) => {
+					if (hasDshbgPayload(event)) event.preventDefault();
+				},
+				onDrop: (event: DragEvent) => {
+					event.preventDefault();
+					handleDropOutside(readDragPayload(event));
+				},
+				children: groups.map((group) => {
+					const rows = rowsByGroup(group);
+					if (rows.length === 0) return null;
+					return jsxs(Fragment, {
+						children: [
+							jsx("div", { className: "dshbg-surfaceGroup", children: t(group === "group" ? "group.name" : group === "builtin" ? "group.builtin" : group === "panel-right" ? "group.panel-right" : "group.panel-bottom") }),
+							rows.map((id) => {
+								const rowCfg = s.areas[id];
+								const meta = s.meta[id];
+								const count = rowCfg?.images.length ?? 0;
+								const active = (rowCfg?.enabled ?? false) && count > 0;
+								const isTab = group === "panel-right" || group === "panel-bottom";
+								const isGroup = meta?.group === "group";
+								const inGroup = meta?.memberOf !== undefined;
+								const draggable = !isGroup; // surfaces drag; members drag out; groups only receive
+								const isDropTargetRow = dropTarget === id;
+								return jsx("div", {
+									role: "button",
+									tabIndex: 0,
+									draggable,
+									className: `dshbg-surfaceRow${isTab ? " dshbg-indent" : ""}${id === focusSurface ? " dshbg-focused" : ""}${meta?.available === false ? " dshbg-unavailable" : ""}${inGroup ? " dshbg-ingroup" : ""}${isDropTargetRow ? " dshbg-dropTarget" : ""}${isGroup ? " dshbg-groupRow" : ""}`,
+									onClick: () => setFocus(id),
+									onKeyDown: (event: KeyboardEvent) => {
+										if (event.key === "Enter" || event.key === " ") {
+											event.preventDefault();
+											setFocus(id);
+										}
+									},
+									onDragStart: (event: DragEvent) => {
+										if (isGroup) return;
+										const payload: DragPayload = inGroup
+											? { kind: "member", groupId: meta?.memberOf ?? "", id }
+											: { kind: "surface", id };
+										setDrag(payload);
+										const transfer = event.dataTransfer;
+										if (transfer !== null && transfer !== undefined) {
+											// Custom MIME carries the payload; text/plain keeps
+											// Firefox happy (it requires setData to start).
+											transfer.setData(DSHBG_MIME, JSON.stringify(payload));
+											transfer.setData("text/plain", id);
+											transfer.effectAllowed = "move";
+										}
+									},
+									onDragEnd: () => {
+										setDrag(null);
+										setDropTarget(null);
+									},
+									onDragOver: (event: DragEvent) => {
+										if (!hasDshbgPayload(event)) return;
+										// Never allow dropping a row onto itself (best-effort:
+										// dataTransfer cannot be read during dragover in
+										// Chrome; the drop handler re-checks anyway).
+										if (drag?.kind === "surface" && !isGroup && drag.id === id) return;
+										event.preventDefault();
+										if (event.dataTransfer !== null && event.dataTransfer !== undefined) event.dataTransfer.dropEffect = "move";
+										setDropTarget(id);
+									},
+									// No onDragLeave: moving between a row and its own
+									// children must not clear the highlighted target, or
+									// a drop released at a child boundary loses the row.
+									onDrop: (event: DragEvent) => {
+										event.preventDefault();
+										// Keep the container's handleDropOutside from also
+										// running on this bubbled drop.
+										event.stopPropagation();
+										handleDropOn(id, readDragPayload(event));
+									},
+									children: jsxs(Fragment, {
+										children: [
+											jsx("input", {
+												type: "checkbox",
+												className: "dshbg-surfaceCheck",
+												checked: checked.includes(id),
+												disabled: inGroup,
+												onChange: () => toggleChecked(id),
+												onClick: (event: MouseEvent) => event.stopPropagation()
+											}),
+											jsx("span", { className: "dshbg-surfaceDot", "data-active": active }),
+											jsx("span", { className: "dshbg-surfaceName", title: surfaceLabel(id), children: surfaceLabel(id) }),
+											isGroup ? jsxs("span", {
+												className: "dshbg-chips",
+												children: [
+													...(meta?.members ?? []).map((member) => jsxs("span", {
+														className: "dshbg-chip",
+														children: [
+															memberLabel(member),
+															jsx("button", {
+																type: "button",
+																className: "dshbg-chipX",
+																"aria-label": t("group.removeMember"),
+																title: t("group.removeMember"),
+																onClick: (event: MouseEvent) => {
+																	event.stopPropagation();
+																	removeMemberFromGroup(id, member);
+																},
+																children: "×"
+															})
+														]
+													}, `chip-${id}-${member}`)),
+													jsx("button", {
+														type: "button",
+														className: "dshbg-chipX dshbg-dissolve",
+														"aria-label": t("group.unmerge"),
+														title: t("group.unmerge"),
+														onClick: (event: MouseEvent) => {
+															event.stopPropagation();
+															unmerge(id);
+														},
+														children: "×"
+													})
+												]
+											}) : inGroup ? jsx("span", { className: "dshbg-surfaceBadge", children: `${t("group.memberBadge")} ${meta?.memberOf ?? ""}` }) : null,
+											jsx("span", { className: "dshbg-surfaceCount", children: count > 0 ? String(count) : "" })
+										]
+									})
+								}, `row-${id}`);
+							})
+						]
+					}, `group-${group}`);
+				})
+			}),
+			jsx("div", { className: "dshbg-surfaceHint", children: t("surface.dragHint") }),
+			/* ---- focused surface detail ---- */
+			jsxs("div", {
+				className: "dshbg-detailHead",
+				children: [
+					jsx("span", { className: "dshbg-detailName", children: surfaceLabel(focusSurface) }),
+					jsx(Button, {
 						variant: cfg.enabled ? "outline" : "ghost",
 						size: "sm",
-						onClick: () => setEnabled(area, !cfg.enabled),
+						onClick: () => setEnabled(focusSurface, !cfg.enabled),
 						children: cfg.enabled ? t("disable") : t("enable")
 					})
 				]
@@ -401,17 +707,17 @@ export function BackgroundSection(props: BackgroundSectionProps) {
 					selected: selected === index,
 					onSelect: (i: number) => {
 						setSelected(i);
-						showImage(area, i);
+						showImage(focusSurface, i);
 					},
 					onRemove,
 					resolvePreview
-				}, `${area}-${index}`))
+				}, `${focusSurface}-${index}`))
 			}) : jsx("div", { className: "dshbg-empty", children: t("list.empty") }),
 			selectedImg !== undefined ? jsx(EditorPanel, {
 				t,
 				img: selectedImg,
 				index: selected as number,
-				onUpdate: (index: number, patch: Partial<ImageConfig>) => updateImage(area, index, patch),
+				onUpdate: (index: number, patch: Partial<ImageConfig>) => updateImage(focusSurface, index, patch),
 				onRemove
 			}) : null,
 			jsxs("div", {
@@ -424,19 +730,19 @@ export function BackgroundSection(props: BackgroundSectionProps) {
 						min: 0,
 						max: 3600,
 						value: cfg.intervalSec,
-						onChange: (event: { target: { value: string } }) => setIntervalSec(area, Number(event.target.value))
+						onChange: (event: { target: { value: string } }) => setIntervalSec(focusSurface, Number(event.target.value))
 					}),
 					jsx(Button, {
 						variant: cfg.random ? "outline" : "ghost",
 						size: "sm",
-						onClick: () => setRandom(area, !cfg.random),
+						onClick: () => setRandom(focusSurface, !cfg.random),
 						children: cfg.random ? t("play.random") : t("play.order")
 					}),
 					jsx(Button, {
 						variant: "ghost",
 						size: "sm",
 						disabled: cfg.images.length < 2,
-						onClick: () => next(area),
+						onClick: () => next(focusSurface),
 						children: t("play.next")
 					}),
 					jsx("span", {
@@ -446,21 +752,12 @@ export function BackgroundSection(props: BackgroundSectionProps) {
 				]
 			}),
 			s.lastError !== null ? jsx("div", { className: "dshbg-error", role: "alert", children: t(`error.${s.lastError}`) }) : null,
-			mixError !== null ? jsx("div", {
-				className: "dshbg-error",
-				role: "alert",
-				children: t("error.mixed").replace("{n}", String(mixError.skipped)).replace("{kind}", t(mixError.skippedKind === "video" ? "media.video" : "media.image"))
-			}) : null,
+			mixError !== null ? jsx("div", { className: "dshbg-error", role: "alert", children: t("error.mix") }) : null,
 			readError ? jsx("div", { className: "dshbg-error", role: "alert", children: t("error.read") }) : null
 		]
 	});
 }
 
-/**
- * The plugin config card (Settings → Plugins): an expandable shell whose body
- * is the full Background editor. The card slots into the `settings.plugin.item`
- * list, so it renders an `<li>` and draws its own chrome.
- */
 export function BackgroundCard(props: BackgroundSectionProps) {
 	const { t } = props;
 	// Collapsed by default, matching the built-in plugin cards.
