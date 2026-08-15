@@ -50,6 +50,7 @@ export const CSS = [
 	 * lead the column, so tree order keeps content above the wallpaper. */
 	"html[data-dsh-bg-sidebar=on] [data-dshbg-sidebar-host]{background:transparent!important;position:relative}",
 	"html[data-dsh-bg-sidebar=on] [data-dshbg-sidebar-host] > *:not([id^=\"dsh-bg-layer\"]){position:relative;background:transparent!important}",
+		"html[data-dsh-bg-sidebar=on] [data-dshbg-sidebar-host] > *:not([id^=\"dsh-bg-layer\"]) > *{position:relative;background:transparent!important}",
 	/* conversation: the surface root (parent of [data-conversation-scroll])
 	 * goes transparent and its children rise above the layers */
 	"html[data-dsh-bg-conversation=on] div:has(> [data-conversation-scroll]){background:transparent!important;position:relative}",
